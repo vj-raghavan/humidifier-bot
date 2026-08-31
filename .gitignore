@@ -1,5 +1,10 @@
+debug_*.jpg
+.env
+*.lock
 *.log
 *.log.*
 *.json
 __pycache__/
 .DS_Store
+*.plist
+*crop*.jpg
