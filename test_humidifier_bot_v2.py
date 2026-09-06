@@ -95,5 +95,82 @@ class VisionReadTests(unittest.TestCase):
             self.assertEqual(reading["remote_humidity"], 55)
 
 
+class ResolveHumidityReadTests(unittest.TestCase):
+    def test_ocr_first_skips_llm_when_parse_is_confident(self):
+        ocr_result = {
+            "text": "21.5 55%",
+            "observations": [],
+            "backend": "tesseract",
+            "detail": {"bin": "tesseract"},
+            "error": None,
+        }
+        with mock.patch.object(bot, "HUMIDITY_READ_MODE", "ocr_first"), mock.patch.object(
+            bot.ocr, "ocr_image", return_value=ocr_result
+        ), mock.patch.object(bot.requests, "post") as post:
+            reading, kind = bot.resolve_humidity_reading("/tmp/fake.jpg", prev_humidity=50)
+            self.assertEqual(kind, ops.VISION_OK)
+            self.assertEqual(reading["source"], "ocr")
+            self.assertEqual(reading["remote_humidity"], 55)
+            self.assertEqual(reading["remote_temp"], 21.5)
+            post.assert_not_called()
+
+    def test_ocr_first_falls_back_to_llm(self):
+        resp = mock.Mock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "choices": [{"message": {"content": '{"remote_humidity": 44, "remote_temp": 20, "local_humidity": null, "local_temp": null}'}}]
+        }
+        ocr_result = {
+            "text": "blur",
+            "observations": [],
+            "backend": "tesseract",
+            "detail": {},
+            "error": None,
+        }
+        with mock.patch.object(bot, "HUMIDITY_READ_MODE", "ocr_first"), mock.patch.object(
+            bot.ocr, "ocr_image", return_value=ocr_result
+        ), mock.patch("builtins.open", mock.mock_open(read_data=b"jpeg")), mock.patch.object(
+            bot.requests, "post", return_value=resp
+        ) as post, mock.patch.object(bot, "sleep_seconds"):
+            reading, kind = bot.resolve_humidity_reading("/tmp/fake.jpg", prev_humidity=50)
+            self.assertEqual(kind, ops.VISION_OK)
+            self.assertEqual(reading["source"], "llm")
+            self.assertEqual(reading["remote_humidity"], 44)
+            post.assert_called()
+
+    def test_ocr_only_does_not_call_llm(self):
+        ocr_result = {
+            "text": "nope",
+            "observations": [],
+            "backend": None,
+            "detail": {},
+            "error": "no local OCR backend",
+        }
+        with mock.patch.object(bot, "HUMIDITY_READ_MODE", "ocr_only"), mock.patch.object(
+            bot.ocr, "ocr_image", return_value=ocr_result
+        ), mock.patch.object(bot.requests, "post") as post:
+            reading, kind = bot.resolve_humidity_reading("/tmp/fake.jpg")
+            self.assertIsNone(reading)
+            self.assertEqual(kind, ops.VISION_SOFT)
+            post.assert_not_called()
+
+    def test_llm_only_skips_ocr(self):
+        resp = mock.Mock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "choices": [{"message": {"content": '{"remote_humidity": 41, "remote_temp": 19, "local_humidity": null, "local_temp": null}'}}]
+        }
+        with mock.patch.object(bot, "HUMIDITY_READ_MODE", "llm_only"), mock.patch.object(
+            bot.ocr, "ocr_image"
+        ) as ocr_image, mock.patch("builtins.open", mock.mock_open(read_data=b"jpeg")), mock.patch.object(
+            bot.requests, "post", return_value=resp
+        ), mock.patch.object(bot, "sleep_seconds"):
+            reading, kind = bot.resolve_humidity_reading("/tmp/fake.jpg")
+            self.assertEqual(reading["source"], "llm")
+            self.assertEqual(reading["remote_humidity"], 41)
+            ocr_image.assert_not_called()
+            self.assertEqual(kind, ops.VISION_OK)
+
+
 if __name__ == "__main__":
     unittest.main()

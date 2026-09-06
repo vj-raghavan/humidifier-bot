@@ -82,8 +82,29 @@ class VisionClassifyTests(unittest.TestCase):
         self.assertTrue(ops.is_crop_like_reason("remote 12% vs local 80% delta > 40"))
         self.assertTrue(ops.is_crop_like_reason("remote_humidity 3% outside 10-95%"))
         self.assertTrue(ops.is_crop_like_reason("Could not parse vision response"))
+        self.assertTrue(ops.is_crop_like_reason("ocr: no numeric tokens"))
         self.assertFalse(ops.is_crop_like_reason("ffmpeg timed out"))
         self.assertFalse(ops.is_crop_like_reason("host unreachable"))
+
+
+class ReadingPlausibleTests(unittest.TestCase):
+    def _kwargs(self):
+        return dict(plausible_min=10, plausible_max=95, max_jump=15, remote_local_max_delta=40)
+
+    def test_ok_and_failures(self):
+        ok, _ = ops.reading_is_plausible({"remote_humidity": 55}, 50, **self._kwargs())
+        self.assertTrue(ok)
+        ok, why = ops.reading_is_plausible({"remote_humidity": 5}, None, **self._kwargs())
+        self.assertFalse(ok)
+        self.assertIn("outside", why)
+        ok, why = ops.reading_is_plausible({"remote_humidity": 80}, 50, **self._kwargs())
+        self.assertFalse(ok)
+        self.assertIn("jumped", why)
+        ok, why = ops.reading_is_plausible(
+            {"remote_humidity": 50, "local_humidity": 95}, None, **self._kwargs()
+        )
+        self.assertFalse(ok)
+        self.assertIn("delta", why)
 
 
 class DigestTests(unittest.TestCase):
