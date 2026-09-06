@@ -1,10 +1,10 @@
 # Humidifier Bot
 
-Humidity-aware plant humidifier control. A camera frame of a ThermoPro display is read by a local vision LLM; a HomeKit smart plug is toggled via macOS Shortcuts (`PH On` / `PH Off`).
+Humidity-aware plant humidifier control. A cropped camera frame of a ThermoPro LCD is read with **local OCR first** (Apple Vision / `VNRecognizeTextRequest` on macOS, or the `tesseract` CLI). The existing vision LLM (`VISION_API_BASE`, typically vLLM on another host) is used only when OCR fails or is low-confidence. A HomeKit smart plug is toggled via macOS Shortcuts (`PH On` / `PH Off`).
 
 Runtime settings live in `.env` (not committed). Copy `.env.example` and fill in camera, vision, and ntfy values. Do not commit `.env`.
 
-The live process is `humidifier_bot_v2.py` (LaunchAgent, single process). `humidifier_bot.py` is the older timed-cycle bot and is not used.
+The live process is `humidifier_bot_v2.py` (LaunchAgent, single process). `humidifier_bot.py` is the older timed-cycle bot and is not used. OCR helpers live in `humidifier_ocr.py`; pause/digest/vision-class helpers in `humidifier_ops.py`.
 
 ## Always-on (macOS)
 
@@ -70,6 +70,26 @@ If ON is commanded but humidity does not rise by `ON_VERIFY_MIN_RISE` within `ON
 
 It will **not** turn ON again until you clear the pause (`resume` or delete the file). After you resume, a later ON that actually raises humidity resets the failed-verify counter.
 
+## Humidity read path (OCR-first)
+
+The Mini (8GB) is not a good host for full VL/vLLM. After ffmpeg crop, each cycle:
+
+1. Runs **local OCR** if `HUMIDITY_READ_MODE` is `ocr_first` (default) or `ocr_only`.
+2. Prefers **Apple Vision** (`VNRecognizeTextRequest`) via PyObjC when that framework is importable, otherwise a small **Swift helper compiled once** (`swiftc`) into a temp binary. Neither path adds pip ML wheels.
+3. If Vision is missing, uses the **`tesseract` CLI** (`brew install tesseract`). `OCR_BACKEND=auto|vision|tesseract` forces a backend.
+4. Parses remote humidity (and temperature when present) from OCR text/boxes, then applies the same plausibility checks as LLM reads (range, jump, remote/local delta) plus `OCR_MIN_CONFIDENCE`.
+5. On a confident, plausible OCR reading, **skips the LLM call**. Logs `Humidity via ocr (...)` and stores `source=ocr` on the history row.
+6. If OCR is missing, garbled, low-confidence, or implausible, `ocr_first` falls back to `VISION_API_BASE` with the existing soft retries and host-down backoff. Logs `Humidity via llm`. `ocr_only` never calls the LLM; `llm_only` skips OCR.
+
+Install on the Mini (Vision is already on macOS; Tesseract is optional):
+
+```bash
+# optional CLI fallback if you do not want to rely on Swift/PyObjC
+brew install tesseract
+```
+
+Logs always say which path produced the reading. Point `VISION_API_BASE` at the MacBook Pro / vLLM box so the Mini only talks to it on OCR misses.
+
 ## Vision host (vLLM on another machine)
 
 `VISION_API_BASE` may be a Mac/LM Studio box. Connection errors, timeouts, and 5xx/429 are **host-down**: at most `VISION_HOST_DOWN_RETRIES` same-frame attempts, then a long sleep (`VISION_HOST_DOWN_BACKOFF`, default 180s) so the bot does not hammer a sleeping laptop. Optional rate-limited ntfy (`VISION_HOST_DOWN_NTFY`). When the host answers again, the normal `CHECK_INTERVAL` resumes.
@@ -103,9 +123,9 @@ Then set `FFMPEG_CROP` in `.env` and restart the LaunchAgent.
 ```bash
 python3 -m pip install -r requirements.txt
 python3 humidifier_bot_v2.py
-python3 -m unittest test_humidifier_ops.py test_humidifier_bot_v2.py
+python3 -m unittest test_humidifier_ops.py test_humidifier_bot_v2.py test_humidifier_ocr.py
 ```
 
 ## Tests
 
-`humidifier_ops.py` holds pause/digest/vision-class/force-sync helpers so they can be tested without Shortcuts or a camera.
+`humidifier_ocr.py` parses ThermoPro OCR text (mocked in `test_humidifier_ocr.py`). `humidifier_ops.py` holds pause/digest/vision-class/force-sync helpers so they can be tested without Shortcuts or a camera.

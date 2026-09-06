@@ -2,7 +2,8 @@
 """
 Smart Humidifier Bot v2 — Humidity-Aware Control
 
-Reads humidity from ThermoPro display via camera + local vision LLM (Qwen2.5-VL),
+Reads humidity from a cropped ThermoPro LCD via local OCR first (Apple Vision
+or Tesseract), with the vision LLM (Qwen2.5-VL on VISION_API_BASE) as fallback,
 then controls humidifier to maintain target range for curry leaf plant.
 
 Schedule: 7 AM – 8 PM
@@ -32,6 +33,7 @@ from datetime import datetime
 
 import requests
 
+import humidifier_ocr as ocr
 import humidifier_ops as ops
 
 # --- Configuration (from .env, then process environment) ---
@@ -76,6 +78,10 @@ def _env_bool(name, default=False):
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_float(name, default):
+    return float(os.environ.get(name, str(default)))
+
+
 _load_dotenv(os.environ.get("HUMIDIFIER_ENV_FILE", os.path.join(_PKG_DIR, ".env")))
 
 NTFY_TOPIC = _env("NTFY_TOPIC", "your-ntfy-topic")
@@ -115,6 +121,17 @@ VISION_HOST_DOWN_NTFY_SECS = _env_int("VISION_HOST_DOWN_NTFY_SECS", 3600)
 FAILED_READ_RETRY_SECS = _env_int("FAILED_READ_RETRY_SECS", 0)
 # Extra wait after consecutive-failure safety OFF (0 = 2× CHECK_INTERVAL)
 FAILED_READ_BACKOFF_SECS = _env_int("FAILED_READ_BACKOFF_SECS", 0)
+
+# Local OCR first (Mac Mini); vision LLM only if OCR fails / is low-confidence.
+HUMIDITY_READ_MODE = ocr.normalize_read_mode(_env("HUMIDITY_READ_MODE", ocr.READ_MODE_OCR_FIRST))
+OCR_BACKEND = _env("OCR_BACKEND", "auto")
+OCR_TIMEOUT = _env_int("OCR_TIMEOUT", 8)
+OCR_MIN_CONFIDENCE = _env_float("OCR_MIN_CONFIDENCE", 0.5)
+OCR_TESSERACT_BIN = _env("OCR_TESSERACT_BIN", "tesseract")
+OCR_TESSERACT_LANG = _env("OCR_TESSERACT_LANG", "eng")
+OCR_TESSERACT_PSM = _env("OCR_TESSERACT_PSM", "6")
+OCR_TESSERACT_WHITELIST = _env("OCR_TESSERACT_WHITELIST", "0123456789.%C")
+OCR_VISION_LEVEL = _env("OCR_VISION_LEVEL", "accurate")
 
 VISION_PROMPT = """This image is a cropped close-up of a ThermoPro display showing the REMOTE sensor (labeled OUT / CH1).
 The large digits for the remote sensor are temperature in Celsius (upper part) and humidity with a % symbol (lower part).
@@ -304,6 +321,80 @@ def _wait_then_retry_vision(attempt, max_retries, retry_delay, reason):
         sleep_seconds(retry_delay)
         return not _runtime["stopping"]
     return False
+
+
+def _ocr_try_read(image_path, prev_humidity):
+    """Local OCR → parse → confidence/plausibility. Returns (reading, why)."""
+    result = ocr.ocr_image(
+        image_path,
+        timeout=OCR_TIMEOUT,
+        prefer=OCR_BACKEND,
+        tesseract_bin=OCR_TESSERACT_BIN,
+        tesseract_lang=OCR_TESSERACT_LANG,
+        tesseract_psm=OCR_TESSERACT_PSM,
+        tesseract_whitelist=OCR_TESSERACT_WHITELIST,
+        vision_level=OCR_VISION_LEVEL,
+    )
+    if result.get("error"):
+        return None, result["error"]
+    reading, why = ocr.parse_thermopro_ocr(
+        result.get("text") or "",
+        result.get("observations") or [],
+        plausible_min=HUMIDITY_PLAUSIBLE_MIN,
+        plausible_max=HUMIDITY_PLAUSIBLE_MAX,
+    )
+    if reading is None:
+        return None, why
+    ok, reason = ocr.accept_ocr_reading(
+        reading,
+        min_confidence=OCR_MIN_CONFIDENCE,
+        prev_humidity=prev_humidity,
+        plausible_min=HUMIDITY_PLAUSIBLE_MIN,
+        plausible_max=HUMIDITY_PLAUSIBLE_MAX,
+        max_jump=MAX_HUMIDITY_JUMP,
+        remote_local_max_delta=REMOTE_LOCAL_MAX_DELTA,
+        plausibility_fn=ops.reading_is_plausible,
+    )
+    if not ok:
+        return None, reason
+    reading["source"] = "ocr"
+    reading["ocr_backend"] = ocr.backend_label(result.get("backend"), result.get("detail"))
+    return reading, "ok"
+
+
+def resolve_humidity_reading(image_path, prev_humidity=None, model_name=None):
+    """OCR-first humidity read with optional vision-LLM fallback.
+
+    Returns (reading_or_None, kind) using the same VISION_* kinds as the LLM
+    path so host-down backoff still applies when falling back.
+    """
+    mode = HUMIDITY_READ_MODE
+    if mode != ocr.READ_MODE_LLM_ONLY:
+        ocr_reading, ocr_why = _ocr_try_read(image_path, prev_humidity)
+        if ocr_reading is not None:
+            logger.info(
+                f"Humidity via ocr ({ocr_reading.get('ocr_backend')} "
+                f"conf={ocr_reading.get('ocr_confidence')} "
+                f"method={ocr_reading.get('ocr_method')}): "
+                f"remote_humidity={ocr_reading.get('remote_humidity')}%, "
+                f"remote_temp={ocr_reading.get('remote_temp')}"
+            )
+            return ocr_reading, ops.VISION_OK
+        if mode == ocr.READ_MODE_OCR_ONLY:
+            logger.warning(f"OCR-only read failed: {ocr_why}")
+            return None, ops.VISION_SOFT
+        logger.info(f"OCR missed ({ocr_why}); falling back to vision LLM")
+
+    reading, kind = read_humidity_from_image(
+        image_path, model_name=model_name or VISION_MODEL_4B
+    )
+    if reading is not None:
+        reading["source"] = "llm"
+        logger.info(
+            f"Humidity via llm: remote_humidity={reading.get('remote_humidity')}%, "
+            f"remote_temp={reading.get('remote_temp')}"
+        )
+    return reading, kind
 
 
 def read_humidity_from_image(
@@ -591,21 +682,15 @@ def last_good_humidity(history):
 
 
 def reading_is_plausible(reading, prev_humidity):
-    """Reject OCR nonsense. Returns (ok, reason). Local sensor is optional."""
-    rh = reading.get("remote_humidity")
-    if not isinstance(rh, (int, float)):
-        return False, "remote_humidity missing"
-    if rh < HUMIDITY_PLAUSIBLE_MIN or rh > HUMIDITY_PLAUSIBLE_MAX:
-        return False, f"remote_humidity {rh}% outside {HUMIDITY_PLAUSIBLE_MIN}-{HUMIDITY_PLAUSIBLE_MAX}%"
-    if prev_humidity is not None and abs(rh - prev_humidity) > MAX_HUMIDITY_JUMP:
-        return False, (
-            f"remote_humidity jumped {prev_humidity}% → {rh}% "
-            f"(max {MAX_HUMIDITY_JUMP} points)"
-        )
-    lh = reading.get("local_humidity")
-    if isinstance(lh, (int, float)) and abs(rh - lh) > REMOTE_LOCAL_MAX_DELTA:
-        return False, f"remote {rh}% vs local {lh}% delta > {REMOTE_LOCAL_MAX_DELTA}"
-    return True, "ok"
+    """Reject OCR/LLM nonsense. Returns (ok, reason). Local sensor is optional."""
+    return ops.reading_is_plausible(
+        reading,
+        prev_humidity,
+        plausible_min=HUMIDITY_PLAUSIBLE_MIN,
+        plausible_max=HUMIDITY_PLAUSIBLE_MAX,
+        max_jump=MAX_HUMIDITY_JUMP,
+        remote_local_max_delta=REMOTE_LOCAL_MAX_DELTA,
+    )
 
 
 def acquire_lock():
@@ -788,7 +873,15 @@ def main():
     logger.info(f"Target: {HUMIDITY_LOW}-{HUMIDITY_HIGH}% RH")
     logger.info(f"Schedule: {START_HOUR}:00 - {END_HOUR}:00")
     logger.info(f"Check interval: {CHECK_INTERVAL}s ({CHECK_INTERVAL // 60}min)")
-    logger.info(f"Model: {VISION_MODEL_4B} @ {VISION_API_BASE}")
+    ocr_backend, ocr_detail = ocr.detect_ocr_backend(
+        prefer=OCR_BACKEND, tesseract_bin=OCR_TESSERACT_BIN
+    )
+    logger.info(
+        f"Humidity read mode: {HUMIDITY_READ_MODE} "
+        f"(local OCR={ocr.backend_label(ocr_backend, ocr_detail)}, "
+        f"min_conf={OCR_MIN_CONFIDENCE}, timeout={OCR_TIMEOUT}s)"
+    )
+    logger.info(f"Vision LLM fallback: {VISION_MODEL_4B} @ {VISION_API_BASE}")
     logger.info(
         f"Vision retries: {VISION_MAX_RETRIES} attempts, {VISION_RETRY_DELAY}s delay, "
         f"timeout {VISION_TIMEOUT}s"
@@ -853,7 +946,11 @@ def main():
         vision_kind = ops.VISION_SOFT
 
         if frame_path:
-            reading, vision_kind = read_humidity_from_image(frame_path, model_name=VISION_MODEL_4B)
+            reading, vision_kind = resolve_humidity_reading(
+                frame_path,
+                prev_humidity=last_good_humidity(history),
+                model_name=VISION_MODEL_4B,
+            )
 
         fail_reason = None
         if reading is not None:
@@ -961,6 +1058,8 @@ def main():
         _runtime["quality_fail_streak"] = 0
         last_successful_read = time.time()
         humidity = reading["remote_humidity"]
+        source = reading.get("source") or "llm"
+        logger.info(f"Using {source} humidity reading: {humidity}%")
 
         history["readings"].append({
             "time": now.isoformat(),
@@ -968,6 +1067,7 @@ def main():
             "remote_temp": reading.get("remote_temp"),
             "local_humidity": reading.get("local_humidity"),
             "local_temp": reading.get("local_temp"),
+            "source": source,
             "state": current_state,
         })
 

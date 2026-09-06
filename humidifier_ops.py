@@ -106,6 +106,34 @@ def classify_vision_exception(exc):
     return VISION_SOFT
 
 
+def reading_is_plausible(
+    reading,
+    prev_humidity,
+    *,
+    plausible_min,
+    plausible_max,
+    max_jump,
+    remote_local_max_delta,
+):
+    """Reject OCR/LLM nonsense. Returns (ok, reason). Local sensor is optional."""
+    if not isinstance(reading, dict):
+        return False, "remote_humidity missing"
+    rh = reading.get("remote_humidity")
+    if not isinstance(rh, (int, float)):
+        return False, "remote_humidity missing"
+    if rh < plausible_min or rh > plausible_max:
+        return False, f"remote_humidity {rh}% outside {plausible_min}-{plausible_max}%"
+    if prev_humidity is not None and abs(rh - prev_humidity) > max_jump:
+        return False, (
+            f"remote_humidity jumped {prev_humidity}% → {rh}% "
+            f"(max {max_jump} points)"
+        )
+    lh = reading.get("local_humidity")
+    if isinstance(lh, (int, float)) and abs(rh - lh) > remote_local_max_delta:
+        return False, f"remote {rh}% vs local {lh}% delta > {remote_local_max_delta}"
+    return True, "ok"
+
+
 def is_crop_like_reason(reason):
     """OCR junk / range / remote-local split — not host-down or camera timeout."""
     if not reason:
