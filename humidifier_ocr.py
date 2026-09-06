@@ -24,8 +24,10 @@ READ_MODES = (READ_MODE_OCR_FIRST, READ_MODE_OCR_ONLY, READ_MODE_LLM_ONLY)
 BACKEND_VISION = "vision"
 BACKEND_TESSERACT = "tesseract"
 
+# 1–2 digit LCD values only. Do not take prefixes of digit soup like "16956" → 16.
+# Vision often reads the humidity "%" as a trailing colon ("79:").
 _NUM_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z\d.])(-?\d{1,2}(?:\.\d{1,2})?)\s*(%|°|deg(?:rees?)?|c)?",
+    r"(?<![A-Za-z\d.])(-?\d{1,2}(?:\.\d{1,2})?)(?!\d)\s*(%|°|:|deg(?:rees?)?|c)?",
     re.I,
 )
 _SWIFT_CACHE_NAME = "humidifier-ocr-vision"
@@ -436,7 +438,7 @@ def _candidates_from_text(text):
         if value is None:
             continue
         suffix = (match.group(2) or "").lower()
-        has_percent = suffix == "%"
+        has_percent = suffix in ("%", ":")
         has_degree = suffix in ("°", "c") or suffix.startswith("deg")
         candidates.append(
             {
@@ -473,7 +475,7 @@ def _candidates_from_observations(observations):
                 {
                     "value": value,
                     "is_int": _is_intish(value),
-                    "has_percent": suffix == "%",
+                    "has_percent": suffix in ("%", ":"),
                     "has_degree": suffix in ("°", "c") or suffix.startswith("deg"),
                     "confidence": float(conf) if isinstance(conf, (int, float)) else None,
                     "y_from_top": y_from_top,
@@ -510,6 +512,19 @@ def _pick_upper(cands):
     if any(c.get("y_from_top") is not None for c in cands):
         return min(cands, key=lambda c: (c.get("y_from_top") is None, c.get("y_from_top") or 0))
     return cands[0]
+
+
+def _ordered_for_layout(cands):
+    """Top-to-bottom (Vision y) or left-to-right document order."""
+    if any(c.get("y_from_top") is not None for c in cands):
+        return sorted(
+            cands,
+            key=lambda c: (
+                c.get("y_from_top") is None,
+                c.get("y_from_top") if c.get("y_from_top") is not None else 0,
+            ),
+        )
+    return list(cands)
 
 
 def _confidence_of(item, fallback):
@@ -550,9 +565,16 @@ def parse_thermopro_ocr(
     elif len(pct) > 1:
         values = sorted({round(c["value"]) for c in pct})
         if len(values) > 1 and (max(values) - min(values)) > 2:
-            return None, "ocr: multiple % humidity values"
-        humidity = _pick_lower(pct)
-        method = "percent"
+            # Two bare % tokens with no layout → ambiguous. OUT-above-IN
+            # (four numbers or vertical boxes) → remote/OUT is the first / upper RH.
+            if len(candidates) >= 4 or any(c.get("y_from_top") is not None for c in pct):
+                humidity = _pick_upper(pct)
+                method = "percent"
+            else:
+                return None, "ocr: multiple % humidity values"
+        else:
+            humidity = _pick_lower(pct)
+            method = "percent"
 
     others = [c for c in candidates if c is not humidity]
     degree_temps = [c for c in others if c["has_degree"] or not c["is_int"]]
@@ -560,9 +582,22 @@ def parse_thermopro_ocr(
         temp = _pick_upper(degree_temps)
 
     if humidity is None:
-        rh_ints = [c for c in candidates if _in_rh(c["value"], plausible_min, plausible_max)]
-        nums = list(candidates)
-        if len(nums) >= 2:
+        nums = _ordered_for_layout(candidates)
+        rh_ints = [c for c in nums if _in_rh(c["value"], plausible_min, plausible_max)]
+        if len(nums) >= 4:
+            out_temp, out_rh = nums[0], nums[1]
+            if _in_rh(out_rh["value"], plausible_min, plausible_max):
+                humidity = out_rh
+                if temp is None and out_temp is not humidity:
+                    temp = out_temp
+                method = "layout"
+            elif len(rh_ints) == 1:
+                humidity = rh_ints[0]
+                method = "single_rh"
+                rest = [c for c in nums if c is not humidity]
+                if rest and temp is None:
+                    temp = _pick_upper(rest)
+        elif len(nums) >= 2:
             upper = _pick_upper(nums)
             lower = _pick_lower(nums)
             if lower is not upper and _in_rh(lower["value"], plausible_min, plausible_max):
