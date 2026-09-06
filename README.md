@@ -16,7 +16,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.samwise.humidifier-b
 
 Logs: `humidifier_v2.log` in this directory, plus `/tmp/humidifier-bot.log` and `/tmp/humidifier-bot.err`.
 
-On start and on SIGTERM the plug is forced OFF. Consecutive ON is capped (`MAX_ON_SECS`, default 30 min) with a cooldown. OCR values outside `HUMIDITY_PLAUSIBLE_MIN`–`MAX`, jumps above `MAX_HUMIDITY_JUMP`, or a large remote/local split are treated as failed reads. `caffeinate -i -w` is started as a **child** of Python.app so idle sleep is asserted without breaking Local Network.
+On start and on SIGTERM the plug is forced OFF. Consecutive ON is capped (`MAX_ON_SECS`, default 30 min) with a cooldown. OCR values outside `HUMIDITY_PLAUSIBLE_MIN`–`MAX`, jumps above `MAX_HUMIDITY_JUMP`, or a large remote/local split are treated as failed reads. Failed vLLM / humidity-resolution attempts retry on the same frame (`VISION_MAX_RETRIES`, `VISION_RETRY_DELAY`); the main loop then recaptures and tries again (`FAILED_READ_RETRY_SECS`, or `CHECK_INTERVAL` if unset). `MAX_CONSECUTIVE_FAILURES` only forces the plug OFF — it does not stop further humidity reads. `caffeinate -i -w` is started as a **child** of Python.app so idle sleep is asserted without breaking Local Network.
 
 Plug toggles use `/usr/bin/shortcuts run` (not the URL scheme). After an ON command, the next few humidity reads must rise by `ON_VERIFY_MIN_RISE` or you get an ntfy warning. Camera frames use unique temp files. Waits use wall-clock so a laptop sleep does not fire a burst of cycles.
 
