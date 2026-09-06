@@ -8,7 +8,7 @@ then controls humidifier to maintain target range for curry leaf plant.
 Schedule: 7 AM – 8 PM
 Check interval: 5 minutes
 Hysteresis: ON below LOW%, OFF above HIGH%, hold between
-Safety: 3 consecutive failed reads → shut off
+Safety: N consecutive failed reads → shut off (keeps retrying humidity reads)
 P0: fail-safe OFF on start/stop, max ON duration, OCR plausibility, single-instance lock
 P1: shortcuts CLI, unique frame files, wall-clock sleep, ON-trend verify
 """
@@ -91,6 +91,13 @@ VISION_MODEL = _env("VISION_MODEL", "qwen/qwen3-vl-4b")
 VISION_API_KEY = _env("VISION_API_KEY", "lm-studio")
 # Back-compat alias used by the reader
 VISION_MODEL_4B = VISION_MODEL
+VISION_MAX_RETRIES = _env_int("VISION_MAX_RETRIES", 3)
+VISION_RETRY_DELAY = _env_int("VISION_RETRY_DELAY", 10)
+VISION_TIMEOUT = _env_int("VISION_TIMEOUT", 60)
+# Wait after a failed capture/read before the next main-loop attempt (0 = CHECK_INTERVAL)
+FAILED_READ_RETRY_SECS = _env_int("FAILED_READ_RETRY_SECS", 0)
+# Extra wait after consecutive-failure safety OFF (0 = 2× CHECK_INTERVAL)
+FAILED_READ_BACKOFF_SECS = _env_int("FAILED_READ_BACKOFF_SECS", 0)
 
 VISION_PROMPT = """This image is a cropped close-up of a ThermoPro display showing the REMOTE sensor (labeled OUT / CH1).
 The large digits for the remote sensor are temperature in Celsius (upper part) and humidity with a % symbol (lower part).
@@ -207,9 +214,36 @@ def capture_frame():
         return None
 
 
-def read_humidity_from_image(image_path, model_name=VISION_MODEL_4B, max_retries=3, retry_delay=10):
+def _failed_read_wait_secs(backoff=False):
+    """Seconds to wait before the next capture/read after a failed humidity cycle."""
+    if backoff:
+        extra = FAILED_READ_BACKOFF_SECS
+        return extra if extra > 0 else CHECK_INTERVAL * 2
+    retry = FAILED_READ_RETRY_SECS
+    return retry if retry > 0 else CHECK_INTERVAL
+
+
+def _wait_then_retry_vision(attempt, max_retries, retry_delay, reason):
+    """Log a failed vision attempt. Return True to retry the same frame."""
+    logger.warning(f"{reason} (attempt {attempt}/{max_retries})")
+    if attempt < max_retries and not _runtime["stopping"]:
+        logger.info(f"Retrying humidity resolution in {retry_delay}s...")
+        sleep_seconds(retry_delay)
+        return not _runtime["stopping"]
+    return False
+
+
+def read_humidity_from_image(
+    image_path,
+    model_name=VISION_MODEL_4B,
+    max_retries=VISION_MAX_RETRIES,
+    retry_delay=VISION_RETRY_DELAY,
+):
     """Use local vision LLM (OpenAI-compatible API) to read humidity from ThermoPro display.
-    Retries on transient failures (e.g. model still loading)."""
+
+    Retries HTTP errors, timeouts, unparseable bodies, and missing/invalid humidity
+    on the same frame. The main loop recaptures after this still returns None.
+    """
     try:
         with open(image_path, 'rb') as f:
             img_b64 = base64.b64encode(f.read()).decode()
@@ -237,20 +271,25 @@ def read_humidity_from_image(image_path, model_name=VISION_MODEL_4B, max_retries
         "temperature": 0
     }
 
+    max_retries = max(1, int(max_retries))
+    retry_delay = max(0, int(retry_delay))
+
     for attempt in range(1, max_retries + 1):
+        if _runtime["stopping"]:
+            return None
         try:
             r = requests.post(
                 f"{VISION_API_BASE}/chat/completions",
                 json=payload,
                 headers={"Authorization": f"Bearer {VISION_API_KEY}"},
-                timeout=60
+                timeout=VISION_TIMEOUT
             )
 
             if r.status_code != 200:
-                logger.warning(f"Vision API returned {r.status_code} (attempt {attempt}/{max_retries}): {r.text[:200]}")
-                if attempt < max_retries:
-                    logger.info(f"Retrying in {retry_delay}s...")
-                    time.sleep(retry_delay)
+                if _wait_then_retry_vision(
+                    attempt, max_retries, retry_delay,
+                    f"Vision API returned {r.status_code}: {r.text[:200]}",
+                ):
                     continue
                 return None
 
@@ -274,25 +313,24 @@ def read_humidity_from_image(image_path, model_name=VISION_MODEL_4B, max_retries
                         f"local_temp={reading.get('local_temp')}"
                     )
                     return reading
-                else:
-                    logger.warning(f"No valid humidity in response: {text}")
-                    return None
+                reason = f"No valid humidity in response: {text}"
             else:
-                logger.warning(f"Could not parse vision response: {text}")
-                return None
+                reason = f"Could not parse vision response: {text}"
+
+            if _wait_then_retry_vision(attempt, max_retries, retry_delay, reason):
+                continue
+            return None
 
         except requests.Timeout:
-            logger.warning(f"Vision API request timed out (attempt {attempt}/{max_retries})")
-            if attempt < max_retries:
-                logger.info(f"Retrying in {retry_delay}s...")
-                time.sleep(retry_delay)
+            if _wait_then_retry_vision(
+                attempt, max_retries, retry_delay, "Vision API request timed out"
+            ):
                 continue
             return None
         except Exception as e:
-            logger.error(f"Vision API error (attempt {attempt}/{max_retries}): {e}")
-            if attempt < max_retries:
-                logger.info(f"Retrying in {retry_delay}s...")
-                time.sleep(retry_delay)
+            if _wait_then_retry_vision(
+                attempt, max_retries, retry_delay, f"Vision API error: {e}"
+            ):
                 continue
             return None
 
@@ -531,12 +569,17 @@ def main():
     logger.info(f"Schedule: {START_HOUR}:00 - {END_HOUR}:00")
     logger.info(f"Check interval: {CHECK_INTERVAL}s ({CHECK_INTERVAL // 60}min)")
     logger.info(f"Model: {VISION_MODEL_4B} @ {VISION_API_BASE}")
+    logger.info(
+        f"Vision retries: {VISION_MAX_RETRIES} attempts, {VISION_RETRY_DELAY}s delay, "
+        f"timeout {VISION_TIMEOUT}s"
+    )
     if FFMPEG_CROP:
         logger.info(f"Frame crop: {FFMPEG_CROP} (w:h:x:y)")
     logger.info(
         f"Safety: max ON {MAX_ON_SECS}s, cooldown {MAX_ON_COOLDOWN_SECS}s, "
         f"plausible RH {HUMIDITY_PLAUSIBLE_MIN}-{HUMIDITY_PLAUSIBLE_MAX}%, "
-        f"max jump {MAX_HUMIDITY_JUMP}"
+        f"max jump {MAX_HUMIDITY_JUMP}, "
+        f"{MAX_CONSECUTIVE_FAILURES} failed reads → OFF (then keep retrying)"
     )
     if TEST_MODE:
         logger.warning("!! TEST MODE — no shortcuts will run !!")
@@ -592,11 +635,18 @@ def main():
 
         if reading is None or reading.get("remote_humidity") is None:
             consecutive_failures += 1
-            logger.warning(f"Read failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})")
+            logger.warning(
+                f"Humidity read failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}); "
+                "will recapture and retry"
+            )
 
             secs_since_read = time.time() - last_successful_read
             if current_state == "ON" and secs_since_read > MAX_ON_WITHOUT_READ_SECS:
-                logger.error(f"Humidifier ON for {int(secs_since_read)}s without a successful read → safety OFF")
+                wait_s = _failed_read_wait_secs(backoff=True)
+                logger.error(
+                    f"Humidifier ON for {int(secs_since_read)}s without a successful read "
+                    f"→ safety OFF, then retry read in {wait_s}s"
+                )
                 send_ntfy(
                     "Humidifier Safety Shutoff (timeout)",
                     f"No successful reading for {int(secs_since_read)}s while humidifier was ON — shutting off",
@@ -608,11 +658,16 @@ def main():
                 _runtime["state"] = current_state
                 on_since = None
                 consecutive_failures = 0
-                sleep_seconds(CHECK_INTERVAL * 2)
+                logger.info(f"Retrying humidity read in {wait_s}s")
+                sleep_seconds(wait_s)
                 continue
 
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                logger.error(f"{MAX_CONSECUTIVE_FAILURES} consecutive failures → safety OFF")
+                wait_s = _failed_read_wait_secs(backoff=True)
+                logger.error(
+                    f"{MAX_CONSECUTIVE_FAILURES} consecutive failures → safety OFF, "
+                    f"then keep retrying humidity reads in {wait_s}s"
+                )
                 send_ntfy(
                     "Humidifier Safety Shutoff",
                     f"{MAX_CONSECUTIVE_FAILURES} consecutive read failures — shutting off humidifier as safety measure",
@@ -623,10 +678,13 @@ def main():
                 persist_state(history, current_state)
                 _runtime["state"] = current_state
                 on_since = None
-                sleep_seconds(CHECK_INTERVAL * 2)
                 consecutive_failures = 0
+                logger.info(f"Retrying humidity read in {wait_s}s (not giving up)")
+                sleep_seconds(wait_s)
             else:
-                sleep_seconds(CHECK_INTERVAL)
+                wait_s = _failed_read_wait_secs(backoff=False)
+                logger.info(f"Retrying humidity read in {wait_s}s")
+                sleep_seconds(wait_s)
             continue
 
         # Successful plausible read
