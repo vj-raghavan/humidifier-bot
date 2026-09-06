@@ -18,7 +18,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.samwise.humidifier-b
 
 Logs: `humidifier_v2.log` in this directory, plus `/tmp/humidifier-bot.log` and `/tmp/humidifier-bot.err`.
 
-On start and on SIGTERM the plug is **always commanded OFF** (`FORCE_SYNC`), even if the bot already thought it was off. Consecutive ON is capped (`MAX_ON_SECS`, default 30 min) with a cooldown. OCR values outside `HUMIDITY_PLAUSIBLE_MIN`–`MAX`, jumps above `MAX_HUMIDITY_JUMP`, or a large remote/local split are treated as failed reads. After `MAX_CONSECUTIVE_FAILURES` failed reads the plug is forced OFF; the loop keeps retrying. `caffeinate -i -w` is started as a **child** of Python.app so idle sleep is asserted without breaking Local Network.
+On start and on SIGTERM the plug is **always commanded OFF** (`FORCE_SYNC`), even if the bot already thought it was off. Consecutive ON is capped (`MAX_ON_SECS`, default 30 min) with a cooldown. OCR values outside `HUMIDITY_PLAUSIBLE_MIN`–`MAX`, jumps above `MAX_HUMIDITY_JUMP`, or a large remote/local split are treated as failed reads. Soft vLLM / humidity-resolution failures retry on the same frame (`VISION_SOFT_RETRIES` / `VISION_MAX_RETRIES`); the main loop then recaptures (`FAILED_READ_RETRY_SECS`, or `CHECK_INTERVAL` if unset). Host-down uses a longer backoff (`VISION_HOST_DOWN_BACKOFF`). `MAX_CONSECUTIVE_FAILURES` only forces the plug OFF — the loop keeps retrying humidity reads. `caffeinate -i -w` is started as a **child** of Python.app so idle sleep is asserted without breaking Local Network.
 
 Plug toggles use `/usr/bin/shortcuts run` (not the URL scheme). After an ON command, the next few humidity reads must rise by `ON_VERIFY_MIN_RISE` or you get an ntfy warning (and, after enough consecutive failed verifies, an empty-tank pause — below). Camera frames use unique temp files. Waits use wall-clock so a laptop sleep does not fire a burst of cycles.
 
@@ -74,7 +74,7 @@ It will **not** turn ON again until you clear the pause (`resume` or delete the 
 
 `VISION_API_BASE` may be a Mac/LM Studio box. Connection errors, timeouts, and 5xx/429 are **host-down**: at most `VISION_HOST_DOWN_RETRIES` same-frame attempts, then a long sleep (`VISION_HOST_DOWN_BACKOFF`, default 180s) so the bot does not hammer a sleeping laptop. Optional rate-limited ntfy (`VISION_HOST_DOWN_NTFY`). When the host answers again, the normal `CHECK_INTERVAL` resumes.
 
-Bad OCR / unparseable JSON / implausible RH stay **soft** failures: same-frame retries (`VISION_SOFT_RETRIES`) and the usual consecutive-read safety OFF.
+Bad OCR / unparseable JSON / implausible RH stay **soft** failures: same-frame retries (`VISION_SOFT_RETRIES`, alias `VISION_MAX_RETRIES`) using interruptible waits, then a recapture (`FAILED_READ_RETRY_SECS`, or `CHECK_INTERVAL` if unset / `FAILED_READ_BACKOFF_SECS` after a safety OFF).
 
 ## Morning / evening digest
 

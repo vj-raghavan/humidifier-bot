@@ -8,7 +8,7 @@ then controls humidifier to maintain target range for curry leaf plant.
 Schedule: 7 AM – 8 PM
 Check interval: 5 minutes
 Hysteresis: ON below LOW%, OFF above HIGH%, hold between
-Safety: 3 consecutive failed reads → shut off
+Safety: N consecutive failed reads → shut off (keeps retrying humidity reads)
 P0: fail-safe OFF on start/stop, max ON duration, OCR plausibility, single-instance lock
 P1: shortcuts CLI, unique frame files, wall-clock sleep, ON-trend verify
 P2: empty-tank pause, vision host backoff, digests, manual pause, crop-drift stills, FORCE_SYNC
@@ -62,6 +62,13 @@ def _env_int(name, default):
     return int(os.environ.get(name, str(default)))
 
 
+def _env_int_any(names, default):
+    for name in names:
+        if os.environ.get(name) is not None:
+            return int(os.environ[name])
+    return int(default)
+
+
 def _env_bool(name, default=False):
     raw = os.environ.get(name)
     if raw is None:
@@ -95,13 +102,19 @@ VISION_MODEL = _env("VISION_MODEL", "qwen/qwen3-vl-4b")
 VISION_API_KEY = _env("VISION_API_KEY", "lm-studio")
 VISION_MODEL_4B = VISION_MODEL
 VISION_TIMEOUT = _env_int("VISION_TIMEOUT", 60)
-VISION_SOFT_RETRIES = _env_int("VISION_SOFT_RETRIES", 3)
-VISION_SOFT_RETRY_DELAY = _env_int("VISION_SOFT_RETRY_DELAY", 10)
+VISION_SOFT_RETRIES = _env_int_any(("VISION_SOFT_RETRIES", "VISION_MAX_RETRIES"), 3)
+VISION_SOFT_RETRY_DELAY = _env_int_any(("VISION_SOFT_RETRY_DELAY", "VISION_RETRY_DELAY"), 10)
+VISION_MAX_RETRIES = VISION_SOFT_RETRIES
+VISION_RETRY_DELAY = VISION_SOFT_RETRY_DELAY
 VISION_HOST_DOWN_RETRIES = _env_int("VISION_HOST_DOWN_RETRIES", 1)
 VISION_HOST_DOWN_RETRY_DELAY = _env_int("VISION_HOST_DOWN_RETRY_DELAY", 5)
 VISION_HOST_DOWN_BACKOFF = _env_int("VISION_HOST_DOWN_BACKOFF", 180)
 VISION_HOST_DOWN_NTFY = _env_bool("VISION_HOST_DOWN_NTFY", True)
 VISION_HOST_DOWN_NTFY_SECS = _env_int("VISION_HOST_DOWN_NTFY_SECS", 3600)
+# Wait after a failed capture/read before the next main-loop attempt (0 = CHECK_INTERVAL)
+FAILED_READ_RETRY_SECS = _env_int("FAILED_READ_RETRY_SECS", 0)
+# Extra wait after consecutive-failure safety OFF (0 = 2× CHECK_INTERVAL)
+FAILED_READ_BACKOFF_SECS = _env_int("FAILED_READ_BACKOFF_SECS", 0)
 
 VISION_PROMPT = """This image is a cropped close-up of a ThermoPro display showing the REMOTE sensor (labeled OUT / CH1).
 The large digits for the remote sensor are temperature in Celsius (upper part) and humidity with a % symbol (lower part).
@@ -270,12 +283,41 @@ def save_crop_preview(cropped_path):
     return paths
 
 
-def read_humidity_from_image(image_path, model_name=VISION_MODEL_4B):
+def _failed_read_wait_secs(backoff=False, host_down=False):
+    """Seconds to wait before the next capture/read after a failed humidity cycle."""
+    if backoff:
+        extra = FAILED_READ_BACKOFF_SECS
+        wait = extra if extra > 0 else CHECK_INTERVAL * 2
+    else:
+        retry = FAILED_READ_RETRY_SECS
+        wait = retry if retry > 0 else CHECK_INTERVAL
+    if host_down:
+        return max(wait, VISION_HOST_DOWN_BACKOFF)
+    return wait
+
+
+def _wait_then_retry_vision(attempt, max_retries, retry_delay, reason):
+    """Log a failed vision attempt. Return True to retry the same frame."""
+    logger.warning(f"{reason} (attempt {attempt}/{max_retries})")
+    if attempt < max_retries and not _runtime["stopping"]:
+        logger.info(f"Retrying humidity resolution in {retry_delay}s...")
+        sleep_seconds(retry_delay)
+        return not _runtime["stopping"]
+    return False
+
+
+def read_humidity_from_image(
+    image_path,
+    model_name=VISION_MODEL_4B,
+    max_retries=None,
+    retry_delay=None,
+):
     """Vision LLM humidity read.
 
     Returns (reading_or_None, kind) where kind is ops.VISION_OK, VISION_SOFT,
-    or VISION_HOST_DOWN. Same-frame retries stay short for host-down; soft
-    OCR/API blips use VISION_SOFT_RETRIES.
+    or VISION_HOST_DOWN. Soft OCR/HTTP blips retry on the same frame
+    (VISION_SOFT_RETRIES / VISION_MAX_RETRIES). Host-down uses fewer attempts
+    then a longer main-loop backoff. The main loop recaptures after None.
     """
     try:
         with open(image_path, "rb") as f:
@@ -302,11 +344,16 @@ def read_humidity_from_image(image_path, model_name=VISION_MODEL_4B):
         "temperature": 0,
     }
 
+    soft_retries = max(1, int(VISION_SOFT_RETRIES if max_retries is None else max_retries))
+    soft_delay = max(0, int(VISION_SOFT_RETRY_DELAY if retry_delay is None else retry_delay))
+    host_retries = max(1, int(VISION_HOST_DOWN_RETRIES))
     host_attempts = 0
     soft_attempts = 0
     last_kind = ops.VISION_SOFT
 
     while True:
+        if _runtime["stopping"]:
+            return None, last_kind
         try:
             r = requests.post(
                 f"{VISION_API_BASE}/chat/completions",
@@ -317,19 +364,16 @@ def read_humidity_from_image(image_path, model_name=VISION_MODEL_4B):
             if r.status_code != 200:
                 kind = ops.classify_http_status(r.status_code)
                 last_kind = kind
-                logger.warning(
-                    f"Vision API returned {r.status_code} ({kind}): {r.text[:200]}"
-                )
+                reason = f"Vision API returned {r.status_code} ({kind}): {r.text[:200]}"
                 if kind == ops.VISION_HOST_DOWN:
                     host_attempts += 1
-                    if host_attempts < max(1, VISION_HOST_DOWN_RETRIES):
-                        time.sleep(VISION_HOST_DOWN_RETRY_DELAY)
+                    if _wait_then_retry_vision(
+                        host_attempts, host_retries, VISION_HOST_DOWN_RETRY_DELAY, reason
+                    ):
                         continue
                     return None, ops.VISION_HOST_DOWN
                 soft_attempts += 1
-                if soft_attempts < VISION_SOFT_RETRIES:
-                    logger.info(f"Retrying in {VISION_SOFT_RETRY_DELAY}s...")
-                    time.sleep(VISION_SOFT_RETRY_DELAY)
+                if _wait_then_retry_vision(soft_attempts, soft_retries, soft_delay, reason):
                     continue
                 return None, ops.VISION_SOFT
 
@@ -349,16 +393,13 @@ def read_humidity_from_image(image_path, model_name=VISION_MODEL_4B):
                         f"local_temp={reading.get('local_temp')}"
                     )
                     return reading, ops.VISION_OK
-                logger.warning(f"No valid humidity in response: {text}")
-                last_kind = ops.VISION_SOFT
+                reason = f"No valid humidity in response: {text}"
             else:
-                logger.warning(f"Could not parse vision response: {text}")
-                last_kind = ops.VISION_SOFT
+                reason = f"Could not parse vision response: {text}"
 
+            last_kind = ops.VISION_SOFT
             soft_attempts += 1
-            if soft_attempts < VISION_SOFT_RETRIES:
-                logger.info(f"Retrying in {VISION_SOFT_RETRY_DELAY}s...")
-                time.sleep(VISION_SOFT_RETRY_DELAY)
+            if _wait_then_retry_vision(soft_attempts, soft_retries, soft_delay, reason):
                 continue
             return None, ops.VISION_SOFT
 
@@ -367,18 +408,18 @@ def read_humidity_from_image(image_path, model_name=VISION_MODEL_4B):
             last_kind = kind
             if kind == ops.VISION_HOST_DOWN:
                 host_attempts += 1
-                logger.warning(
-                    f"Vision host down ({host_attempts}/{max(1, VISION_HOST_DOWN_RETRIES)}): {e}"
-                )
-                if host_attempts < max(1, VISION_HOST_DOWN_RETRIES):
-                    time.sleep(VISION_HOST_DOWN_RETRY_DELAY)
+                if _wait_then_retry_vision(
+                    host_attempts,
+                    host_retries,
+                    VISION_HOST_DOWN_RETRY_DELAY,
+                    f"Vision host down: {e}",
+                ):
                     continue
                 return None, ops.VISION_HOST_DOWN
             soft_attempts += 1
-            logger.error(f"Vision API error ({soft_attempts}/{VISION_SOFT_RETRIES}): {e}")
-            if soft_attempts < VISION_SOFT_RETRIES:
-                logger.info(f"Retrying in {VISION_SOFT_RETRY_DELAY}s...")
-                time.sleep(VISION_SOFT_RETRY_DELAY)
+            if _wait_then_retry_vision(
+                soft_attempts, soft_retries, soft_delay, f"Vision API error: {e}"
+            ):
                 continue
             return None, last_kind
 
@@ -748,12 +789,17 @@ def main():
     logger.info(f"Schedule: {START_HOUR}:00 - {END_HOUR}:00")
     logger.info(f"Check interval: {CHECK_INTERVAL}s ({CHECK_INTERVAL // 60}min)")
     logger.info(f"Model: {VISION_MODEL_4B} @ {VISION_API_BASE}")
+    logger.info(
+        f"Vision retries: {VISION_MAX_RETRIES} attempts, {VISION_RETRY_DELAY}s delay, "
+        f"timeout {VISION_TIMEOUT}s"
+    )
     if FFMPEG_CROP:
         logger.info(f"Frame crop: {FFMPEG_CROP} (w:h:x:y)")
     logger.info(
         f"Safety: max ON {MAX_ON_SECS}s, cooldown {MAX_ON_COOLDOWN_SECS}s, "
         f"plausible RH {HUMIDITY_PLAUSIBLE_MIN}-{HUMIDITY_PLAUSIBLE_MAX}%, "
-        f"max jump {MAX_HUMIDITY_JUMP}"
+        f"max jump {MAX_HUMIDITY_JUMP}, "
+        f"{MAX_CONSECUTIVE_FAILURES} failed reads → OFF (then keep retrying)"
     )
     logger.info(
         f"Empty-tank pause after {EMPTY_TANK_FAILS} failed ON-verifies; "
@@ -832,8 +878,9 @@ def main():
             consecutive_failures += 1
             ops.bump_stat(history, "failed_reads", 1)
             persist_state(history, current_state)
+            host_down = vision_kind == ops.VISION_HOST_DOWN
 
-            if vision_kind == ops.VISION_HOST_DOWN:
+            if host_down:
                 ops.bump_stat(history, "host_down", 1)
                 if not _runtime.get("host_was_down"):
                     logger.warning(f"Vision host looks down ({VISION_API_BASE}) — backing off")
@@ -848,11 +895,18 @@ def main():
                         rate_secs=VISION_HOST_DOWN_NTFY_SECS,
                     )
             else:
-                logger.warning(f"Read failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})")
+                logger.warning(
+                    f"Humidity read failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}); "
+                    "will recapture and retry"
+                )
 
             secs_since_read = time.time() - last_successful_read
             if current_state == "ON" and secs_since_read > MAX_ON_WITHOUT_READ_SECS:
-                logger.error(f"Humidifier ON for {int(secs_since_read)}s without a successful read → safety OFF")
+                wait_s = _failed_read_wait_secs(backoff=True, host_down=host_down)
+                logger.error(
+                    f"Humidifier ON for {int(secs_since_read)}s without a successful read "
+                    f"→ safety OFF, then retry read in {wait_s}s"
+                )
                 send_ntfy(
                     "Humidifier Safety Shutoff (timeout)",
                     f"No successful reading for {int(secs_since_read)}s while humidifier was ON — shutting off",
@@ -867,13 +921,16 @@ def main():
                 _runtime["state"] = current_state
                 _runtime["on_since"] = None
                 consecutive_failures = 0
-                sleep_seconds(
-                    VISION_HOST_DOWN_BACKOFF if vision_kind == ops.VISION_HOST_DOWN else CHECK_INTERVAL * 2
-                )
+                logger.info(f"Retrying humidity read in {wait_s}s")
+                sleep_seconds(wait_s)
                 continue
 
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                logger.error(f"{MAX_CONSECUTIVE_FAILURES} consecutive failures → safety OFF")
+                wait_s = _failed_read_wait_secs(backoff=True, host_down=host_down)
+                logger.error(
+                    f"{MAX_CONSECUTIVE_FAILURES} consecutive failures → safety OFF, "
+                    f"then keep retrying humidity reads in {wait_s}s"
+                )
                 send_ntfy(
                     "Humidifier Safety Shutoff",
                     f"{MAX_CONSECUTIVE_FAILURES} consecutive read failures — shutting off humidifier as safety measure",
@@ -887,14 +944,13 @@ def main():
                 persist_state(history, current_state)
                 _runtime["state"] = current_state
                 _runtime["on_since"] = None
-                sleep_seconds(
-                    VISION_HOST_DOWN_BACKOFF if vision_kind == ops.VISION_HOST_DOWN else CHECK_INTERVAL * 2
-                )
                 consecutive_failures = 0
-            elif vision_kind == ops.VISION_HOST_DOWN:
-                sleep_seconds(VISION_HOST_DOWN_BACKOFF)
+                logger.info(f"Retrying humidity read in {wait_s}s (not giving up)")
+                sleep_seconds(wait_s)
             else:
-                sleep_seconds(CHECK_INTERVAL)
+                wait_s = _failed_read_wait_secs(backoff=False, host_down=host_down)
+                logger.info(f"Retrying humidity read in {wait_s}s")
+                sleep_seconds(wait_s)
             continue
 
         if _runtime.get("host_was_down"):

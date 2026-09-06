@@ -45,11 +45,24 @@ class SetHumidifierForceSyncTests(unittest.TestCase):
             self.assertTrue(kwargs.get("force") or (len(args) > 3 and args[3] is True))
 
 
+class FailedReadWaitTests(unittest.TestCase):
+    def test_defaults_and_host_down_floor(self):
+        with mock.patch.object(bot, "CHECK_INTERVAL", 60), mock.patch.object(
+            bot, "FAILED_READ_RETRY_SECS", 0
+        ), mock.patch.object(bot, "FAILED_READ_BACKOFF_SECS", 0), mock.patch.object(
+            bot, "VISION_HOST_DOWN_BACKOFF", 180
+        ):
+            self.assertEqual(bot._failed_read_wait_secs(backoff=False), 60)
+            self.assertEqual(bot._failed_read_wait_secs(backoff=True), 120)
+            self.assertEqual(bot._failed_read_wait_secs(backoff=False, host_down=True), 180)
+            self.assertEqual(bot._failed_read_wait_secs(backoff=True, host_down=True), 180)
+
+
 class VisionReadTests(unittest.TestCase):
     def test_connection_error_is_host_down_without_soft_retries(self):
         with mock.patch("builtins.open", mock.mock_open(read_data=b"jpeg")), mock.patch.object(
             bot.requests, "post", side_effect=ConnectionError("refused")
-        ) as post, mock.patch.object(bot.time, "sleep") as sleep:
+        ) as post, mock.patch.object(bot, "sleep_seconds") as sleep:
             reading, kind = bot.read_humidity_from_image("/tmp/fake.jpg")
             self.assertIsNone(reading)
             self.assertEqual(kind, ops.VISION_HOST_DOWN)
@@ -62,10 +75,11 @@ class VisionReadTests(unittest.TestCase):
         resp.json.return_value = {"choices": [{"message": {"content": "not json"}}]}
         with mock.patch("builtins.open", mock.mock_open(read_data=b"jpeg")), mock.patch.object(
             bot.requests, "post", return_value=resp
-        ), mock.patch.object(bot.time, "sleep"):
+        ), mock.patch.object(bot, "sleep_seconds") as sleep:
             reading, kind = bot.read_humidity_from_image("/tmp/fake.jpg")
             self.assertIsNone(reading)
             self.assertEqual(kind, ops.VISION_SOFT)
+            self.assertEqual(sleep.call_count, 2)
 
     def test_ok_reading(self):
         resp = mock.Mock()
@@ -75,7 +89,7 @@ class VisionReadTests(unittest.TestCase):
         }
         with mock.patch("builtins.open", mock.mock_open(read_data=b"jpeg")), mock.patch.object(
             bot.requests, "post", return_value=resp
-        ), mock.patch.object(bot.time, "sleep"):
+        ), mock.patch.object(bot, "sleep_seconds"):
             reading, kind = bot.read_humidity_from_image("/tmp/fake.jpg")
             self.assertEqual(kind, ops.VISION_OK)
             self.assertEqual(reading["remote_humidity"], 55)
