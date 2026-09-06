@@ -106,13 +106,15 @@ A streak of remote/local splits, out-of-range RH, or unparseable OCR (`CROP_DRIF
 
 ## Crop (remote OUT/CH1 only)
 
-The live Tapo stream is 2304×1296. `FFMPEG_CROP` is ffmpeg `w:h:x:y`. The checked-in default `640:380:580:170` is the top LCD (temperature + remote humidity), not the indoor IN row.
+The live Tapo stream is 2304×1296. `FFMPEG_CROP` is ffmpeg `w:h:x:y`. Crop the **OUT / CH1** block (temperature above remote humidity). ThermoPro draws indoor **IN** under that; the parser prefers the first/upper humidity when both appear.
+
+A tight box `640:380:580:170` (older default) often yields **empty** Apple Vision OCR on this stream. A working crop on 2304×1296 is approximately `700:520:750:350` (may include a sliver of the IN row; that is OK).
 
 If the camera moves, grab a still and try a new box:
 
 ```bash
 # one still (bot already has LAN access; or copy from /tmp)
-ffmpeg -i debug_full_frame.jpg -vf crop=640:380:580:170 preview.jpg
+ffmpeg -i debug_full_frame.jpg -vf crop=700:520:750:350 preview.jpg
 open preview.jpg
 ```
 

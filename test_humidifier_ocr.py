@@ -113,6 +113,69 @@ class ParseThermoproOcrTests(unittest.TestCase):
         self.assertIsNone(reading)
         self.assertTrue(why.startswith("ocr:"))
 
+    def test_colon_token_is_humidity(self):
+        reading, why = ocr.parse_thermopro_ocr("79:")
+        self.assertEqual(why, "ok")
+        self.assertEqual(reading["remote_humidity"], 79)
+        self.assertEqual(reading["ocr_method"], "percent")
+
+    def test_percent_seventy_nine(self):
+        reading, why = ocr.parse_thermopro_ocr("79%")
+        self.assertEqual(why, "ok")
+        self.assertEqual(reading["remote_humidity"], 79)
+        self.assertEqual(reading["ocr_method"], "percent")
+
+    def test_vision_colon_over_digit_soup(self):
+        reading, why = ocr.parse_thermopro_ocr("I0 79: 16956")
+        self.assertEqual(why, "ok")
+        self.assertEqual(reading["remote_humidity"], 79)
+
+        observations = [
+            {
+                "text": "I0",
+                "confidence": 0.4,
+                "x": 0.05,
+                "y": 0.72,
+                "w": 0.15,
+                "h": 0.12,
+                "origin": "vision",
+            },
+            {
+                "text": "79:",
+                "confidence": 0.94,
+                "x": 0.25,
+                "y": 0.42,
+                "w": 0.28,
+                "h": 0.18,
+                "origin": "vision",
+            },
+            {
+                "text": "16956",
+                "confidence": 0.35,
+                "x": 0.15,
+                "y": 0.08,
+                "w": 0.55,
+                "h": 0.22,
+                "origin": "vision",
+            },
+        ]
+        reading, why = ocr.parse_thermopro_ocr("I0 79: 16956", observations)
+        self.assertEqual(why, "ok")
+        self.assertEqual(reading["remote_humidity"], 79)
+        self.assertGreaterEqual(reading["ocr_confidence"], 0.9)
+
+    def test_four_number_layout_prefers_out_humidity(self):
+        reading, why = ocr.parse_thermopro_ocr("22.5 55 21.0 48")
+        self.assertEqual(why, "ok")
+        self.assertEqual(reading["remote_humidity"], 55)
+        self.assertEqual(reading["remote_temp"], 22.5)
+        self.assertEqual(reading["ocr_method"], "layout")
+
+        reading, why = ocr.parse_thermopro_ocr("22 55 21 48")
+        self.assertEqual(why, "ok")
+        self.assertEqual(reading["remote_humidity"], 55)
+        self.assertEqual(reading["remote_temp"], 22)
+
     def test_tesseract_tsv_words(self):
         tsv = (
             "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
