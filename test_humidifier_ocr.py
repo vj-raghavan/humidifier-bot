@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Unit tests for ThermoPro OCR parse helpers (no camera, no Vision/Tesseract)."""
 
+import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -211,6 +213,134 @@ class DetectBackendTests(unittest.TestCase):
             backend, detail = ocr.detect_ocr_backend(prefer="tesseract")
             self.assertEqual(backend, "tesseract")
             self.assertEqual(detail["bin"], "/opt/homebrew/bin/tesseract")
+
+
+class CropAndPreprocessTests(unittest.TestCase):
+    def test_parse_and_default_rh_crop(self):
+        self.assertEqual(ocr.parse_crop_spec("360:140:160:150"), (360, 140, 160, 150))
+        self.assertIsNone(ocr.parse_crop_spec(""))
+        self.assertIsNone(ocr.parse_crop_spec("nope"))
+        spec = ocr.default_rh_crop(640, 420)
+        w, h, x, y = ocr.parse_crop_spec(spec)
+        self.assertEqual((w, h, x, y), (461, 143, 102, 151))
+        self.assertEqual(ocr.resolve_rh_crop("360:140:160:150", 640, 420), "360:140:160:150")
+        self.assertEqual(ocr.resolve_rh_crop("", 640, 420), spec)
+        # Clamp a box that hangs off the right/bottom edge.
+        self.assertEqual(ocr.resolve_rh_crop("400:200:400:300", 640, 420), "240:120:400:300")
+
+    def test_vf_filter_order(self):
+        filters = ocr.ocr_vf_filters(
+            crop="360:140:160:150",
+            preprocess=True,
+            upscale=2,
+            contrast=1.6,
+            threshold=160,
+            invert=True,
+        )
+        self.assertEqual(filters[0], "crop=360:140:160:150")
+        self.assertTrue(filters[1].startswith("scale=iw*2"))
+        self.assertEqual(filters[2], "format=gray")
+        self.assertEqual(filters[3], "eq=contrast=1.6")
+        self.assertEqual(filters[4], "negate")
+        self.assertIn("160", filters[5])
+        self.assertEqual(
+            ocr.ocr_vf_filters(crop="10:10:0:0", preprocess=False),
+            ["crop=10:10:0:0"],
+        )
+
+    def test_pillow_preprocess_upscale_gray(self):
+        from PIL import Image
+
+        fd, src = tempfile.mkstemp(prefix="ocr_src_", suffix=".png")
+        os.close(fd)
+        fd, dest = tempfile.mkstemp(prefix="ocr_dst_", suffix=".png")
+        os.close(fd)
+        try:
+            Image.new("RGB", (40, 20), color=(200, 30, 30)).save(src)
+            path, is_temp, err = ocr.prepare_ocr_frame(
+                src,
+                dest,
+                crop="20:10:10:5",
+                preprocess=True,
+                upscale=2,
+                contrast=1.0,
+                threshold=0,
+                invert=False,
+                impl="pillow",
+            )
+            self.assertIsNone(err)
+            self.assertEqual(path, dest)
+            with Image.open(dest) as out:
+                self.assertEqual(out.size, (40, 20))  # 20x10 crop, then 2×
+                self.assertEqual(out.mode, "L")
+        finally:
+            for p in (src, dest):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+
+class ConsensusHumidityTests(unittest.TestCase):
+    def _rh(self, value, conf=0.9):
+        return {
+            "remote_humidity": value,
+            "remote_temp": 21,
+            "ocr_confidence": conf,
+            "ocr_method": "percent",
+        }
+
+    def test_median_when_all_close(self):
+        reading, why, detail = ocr.consensus_humidity(
+            [self._rh(54), self._rh(55), self._rh(56)],
+            min_agree=2,
+            max_delta=2,
+        )
+        self.assertEqual(why, "ok")
+        self.assertEqual(reading["remote_humidity"], 55)
+        self.assertEqual(detail["method"], "median")
+        self.assertEqual(detail["agree"], 3)
+
+    def test_cluster_ignores_outlier(self):
+        reading, why, detail = ocr.consensus_humidity(
+            [self._rh(55), self._rh(56), self._rh(80)],
+            min_agree=2,
+            max_delta=2,
+        )
+        self.assertEqual(why, "ok")
+        self.assertIn(reading["remote_humidity"], (55, 56))
+        self.assertEqual(detail["method"], "cluster")
+        self.assertEqual(detail["agree"], 2)
+
+    def test_failed_when_spread_too_wide(self):
+        reading, why, detail = ocr.consensus_humidity(
+            [self._rh(40), self._rh(70), self._rh(90)],
+            min_agree=2,
+            max_delta=2,
+        )
+        self.assertIsNone(reading)
+        self.assertIn("ocr consensus", why)
+        self.assertEqual(detail["agree"], 1)
+
+    def test_none_frames_and_partial(self):
+        reading, why, _ = ocr.consensus_humidity([None, None, None], min_agree=2, max_delta=2)
+        self.assertIsNone(reading)
+        self.assertIn("no humidity", why)
+
+        reading, why, detail = ocr.consensus_humidity(
+            [None, self._rh(55), self._rh(56)],
+            min_agree=2,
+            max_delta=2,
+        )
+        self.assertEqual(why, "ok")
+        self.assertIn(reading["remote_humidity"], (55, 56))
+        self.assertEqual(detail["agree"], 2)
+
+    def test_single_reading_min_agree_clamped(self):
+        reading, why, detail = ocr.consensus_humidity([self._rh(58)], min_agree=2, max_delta=2)
+        self.assertEqual(why, "ok")
+        self.assertEqual(reading["remote_humidity"], 58)
+        self.assertEqual(detail["min_agree"], 1)
 
 
 if __name__ == "__main__":

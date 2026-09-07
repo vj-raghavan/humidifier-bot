@@ -72,14 +72,16 @@ It will **not** turn ON again until you clear the pause (`resume` or delete the 
 
 ## Humidity read path (OCR-first)
 
-The Mini (8GB) is not a good host for full VL/vLLM. After ffmpeg crop, each cycle:
+The Mini (8GB) is not a good host for full VL/vLLM. After ffmpeg device crop, each cycle:
 
-1. Runs **local OCR** if `HUMIDITY_READ_MODE` is `ocr_first` (default) or `ocr_only`.
-2. Prefers **Apple Vision** (`VNRecognizeTextRequest`) via PyObjC when that framework is importable, otherwise a small **Swift helper compiled once** (`swiftc`) into a temp binary. Neither path adds pip ML wheels.
-3. If Vision is missing, uses the **`tesseract` CLI** (`brew install tesseract`). `OCR_BACKEND=auto|vision|tesseract` forces a backend.
-4. Parses remote humidity (and temperature when present) from OCR text/boxes, then applies the same plausibility checks as LLM reads (range, jump, remote/local delta) plus `OCR_MIN_CONFIDENCE`.
-5. On a confident, plausible OCR reading, **skips the LLM call**. Logs `Humidity via ocr (...)` and stores `source=ocr` on the history row.
-6. If OCR is missing, garbled, low-confidence, or implausible, `ocr_first` falls back to `VISION_API_BASE` with the existing soft retries and host-down backoff. Logs `Humidity via llm`. `ocr_only` never calls the LLM; `llm_only` skips OCR.
+1. Captures **N frames** (`OCR_CONSENSUS_FRAMES`, default 3) spaced `OCR_CONSENSUS_GAP_SECS` (default 0.7s).
+2. On each frame, applies an optional **RH-only crop** (`FFMPEG_CROP_RH`) plus preprocess (upscale, grayscale, contrast, optional threshold/invert), then runs **local OCR** if `HUMIDITY_READ_MODE` is `ocr_first` (default) or `ocr_only`.
+3. Prefers **Apple Vision** (`VNRecognizeTextRequest`) via PyObjC when that framework is importable, otherwise a small **Swift helper compiled once** (`swiftc`) into a temp binary. Neither path adds pip ML wheels.
+4. If Vision is missing, uses the **`tesseract` CLI** (`brew install tesseract`). `OCR_BACKEND=auto|vision|tesseract` forces a backend.
+5. Parses remote humidity from each frame, then **consensus**: at least `OCR_CONSENSUS_MIN_AGREE` (default 2) values within `OCR_CONSENSUS_MAX_DELTA` points (default 2), or the median when all plausible reads are close. Logs every frame and the decision. Failed consensus is a failed OCR read (`ocr_first` → LLM; `ocr_only` retries as today).
+6. Applies the same plausibility checks as LLM reads (range, jump, remote/local delta) plus `OCR_MIN_CONFIDENCE`.
+7. On a confident, plausible OCR reading, **skips the LLM call**. Logs `Humidity via ocr (...)` and stores `source=ocr` on the history row.
+8. If OCR is missing, garbled, low-confidence, implausible, or consensus fails, `ocr_first` falls back to `VISION_API_BASE` using the **device crop** (not the RH-only box) with the existing soft retries and host-down backoff. Logs `Humidity via llm`. `ocr_only` never calls the LLM; `llm_only` skips OCR.
 
 Install on the Mini (Vision is already on macOS; Tesseract is optional):
 
@@ -106,19 +108,24 @@ A streak of remote/local splits, out-of-range RH, or unparseable OCR (`CROP_DRIF
 
 ## Crop (remote OUT/CH1 only)
 
-The live Tapo stream is 2304×1296. `FFMPEG_CROP` is ffmpeg `w:h:x:y`. Crop the **OUT / CH1** block (temperature above remote humidity). ThermoPro draws indoor **IN** under that; the parser prefers the first/upper humidity when both appear.
+The live Tapo stream is 2304×1296. `FFMPEG_CROP` is ffmpeg `w:h:x:y` on capture (the **device** box). Crop the **OUT / CH1** block (temperature above remote humidity). ThermoPro draws indoor **IN** under that; the parser prefers the first/upper humidity when both appear.
 
-A tight box `640:380:580:170` (older default) often yields **empty** Apple Vision OCR on this stream. A working crop on 2304×1296 is approximately `700:520:750:350` (may include a sliver of the IN row; that is OK).
+A tight box `640:380:580:170` (older default) often yields **empty** Apple Vision OCR on this stream. On 2304×1296 the Mini’s live device crop has been around `640:420:800:360` (alternate that also worked: `700:520:750:350`).
+
+`FFMPEG_CROP_RH` is a **second** crop of that captured JPEG, humidity digits only. Leave it empty to use a default upper/mid sub-crop (~72%×34% of the device frame at x=16%, y=36%). A good starting RH box on a 640×420 device crop is `360:140:160:150`.
 
 If the camera moves, grab a still and try a new box:
 
 ```bash
 # one still (bot already has LAN access; or copy from /tmp)
-ffmpeg -i debug_full_frame.jpg -vf crop=700:520:750:350 preview.jpg
-open preview.jpg
+ffmpeg -i debug_full_frame.jpg -vf crop=640:420:800:360 preview.jpg
+ffmpeg -i preview.jpg -vf crop=360:140:160:150 rh.jpg
+open preview.jpg rh.jpg
 ```
 
-Then set `FFMPEG_CROP` in `.env` and restart the LaunchAgent.
+Then set `FFMPEG_CROP` / `FFMPEG_CROP_RH` in `.env` and restart the LaunchAgent.
+
+OCR preprocess (`OCR_PREPROCESS=1`) upscales (`OCR_UPSCALE=2`), converts to grayscale, boosts contrast (`OCR_CONTRAST=1.6`), and optionally thresholds / inverts (`OCR_THRESHOLD`, `OCR_INVERT`) before Vision or Tesseract.
 
 ## Manual run
 
@@ -130,4 +137,4 @@ python3 -m unittest test_humidifier_ops.py test_humidifier_bot_v2.py test_humidi
 
 ## Tests
 
-`humidifier_ocr.py` parses ThermoPro OCR text (mocked in `test_humidifier_ocr.py`). `humidifier_ops.py` holds pause/digest/vision-class/force-sync helpers so they can be tested without Shortcuts or a camera.
+`humidifier_ocr.py` parses ThermoPro OCR text and covers RH crop, preprocess, and multi-frame consensus (mocked in `test_humidifier_ocr.py`). `humidifier_ops.py` holds pause/digest/vision-class/force-sync helpers so they can be tested without Shortcuts or a camera.

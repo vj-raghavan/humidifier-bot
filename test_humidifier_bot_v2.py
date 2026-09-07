@@ -172,5 +172,76 @@ class ResolveHumidityReadTests(unittest.TestCase):
             self.assertEqual(kind, ops.VISION_OK)
 
 
+class OcrConsensusResolveTests(unittest.TestCase):
+    def test_two_of_three_agree_skips_llm(self):
+        results = [
+            {"text": "55%", "observations": [], "backend": "tesseract", "detail": {}, "error": None},
+            {"text": "56%", "observations": [], "backend": "tesseract", "detail": {}, "error": None},
+            {"text": "80%", "observations": [], "backend": "tesseract", "detail": {}, "error": None},
+        ]
+        with mock.patch.object(bot, "HUMIDITY_READ_MODE", "ocr_first"), mock.patch.object(
+            bot, "OCR_CONSENSUS_MIN_AGREE", 2
+        ), mock.patch.object(bot, "OCR_CONSENSUS_MAX_DELTA", 2), mock.patch.object(
+            bot.ocr, "ocr_image", side_effect=results
+        ), mock.patch.object(bot.requests, "post") as post:
+            reading, kind = bot.resolve_humidity_reading(
+                "/tmp/a.jpg",
+                prev_humidity=54,
+                ocr_frame_paths=["/tmp/a.jpg", "/tmp/b.jpg", "/tmp/c.jpg"],
+            )
+            self.assertEqual(kind, ops.VISION_OK)
+            self.assertEqual(reading["source"], "ocr")
+            self.assertIn(reading["remote_humidity"], (55, 56))
+            post.assert_not_called()
+
+    def test_disagreement_falls_back_to_llm(self):
+        results = [
+            {"text": "40%", "observations": [], "backend": "tesseract", "detail": {}, "error": None},
+            {"text": "70%", "observations": [], "backend": "tesseract", "detail": {}, "error": None},
+            {"text": "90%", "observations": [], "backend": "tesseract", "detail": {}, "error": None},
+        ]
+        resp = mock.Mock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"remote_humidity": 55, "remote_temp": 21, "local_humidity": null, "local_temp": null}'
+                    }
+                }
+            ]
+        }
+        with mock.patch.object(bot, "HUMIDITY_READ_MODE", "ocr_first"), mock.patch.object(
+            bot, "OCR_CONSENSUS_MIN_AGREE", 2
+        ), mock.patch.object(bot, "OCR_CONSENSUS_MAX_DELTA", 2), mock.patch.object(
+            bot.ocr, "ocr_image", side_effect=results
+        ), mock.patch("builtins.open", mock.mock_open(read_data=b"jpeg")), mock.patch.object(
+            bot.requests, "post", return_value=resp
+        ) as post, mock.patch.object(bot, "sleep_seconds"):
+            reading, kind = bot.resolve_humidity_reading(
+                "/tmp/a.jpg",
+                prev_humidity=54,
+                ocr_frame_paths=["/tmp/a.jpg", "/tmp/b.jpg", "/tmp/c.jpg"],
+            )
+            self.assertEqual(kind, ops.VISION_OK)
+            self.assertEqual(reading["source"], "llm")
+            self.assertEqual(reading["remote_humidity"], 55)
+            post.assert_called()
+
+
+class CaptureCycleTests(unittest.TestCase):
+    def test_n_frames_and_gaps(self):
+        with mock.patch.object(bot, "OCR_CONSENSUS_FRAMES", 3), mock.patch.object(
+            bot, "OCR_CONSENSUS_GAP_SECS", 0.5
+        ), mock.patch.object(
+            bot, "capture_frame", side_effect=["/a.jpg", "/b.jpg", "/c.jpg"]
+        ) as cap, mock.patch.object(bot, "sleep_seconds") as sleep:
+            paths = bot.capture_cycle_frames()
+            self.assertEqual(paths, ["/a.jpg", "/b.jpg", "/c.jpg"])
+            self.assertEqual(cap.call_count, 3)
+            self.assertEqual(sleep.call_count, 2)
+            sleep.assert_called_with(0.5)
+
+
 if __name__ == "__main__":
     unittest.main()
