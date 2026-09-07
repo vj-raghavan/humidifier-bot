@@ -394,7 +394,7 @@ def _prepare_ocr_input(src_path):
 
 
 def _ocr_parse_one(src_path, index, total):
-    """OCR+parse one device frame (no jump check). Logs the per-frame result."""
+    """OCR+parse one device frame (no jump check). Returns (reading, why)."""
     prepared, is_temp = _prepare_ocr_input(src_path)
     try:
         result = ocr.ocr_image(
@@ -408,8 +408,9 @@ def _ocr_parse_one(src_path, index, total):
             vision_level=OCR_VISION_LEVEL,
         )
         if result.get("error"):
-            logger.info(f"OCR frame {index}/{total}: failed ({result['error']})")
-            return None
+            why = result["error"]
+            logger.info(f"OCR frame {index}/{total}: failed ({why})")
+            return None, why
         reading, why = ocr.parse_thermopro_ocr(
             result.get("text") or "",
             result.get("observations") or [],
@@ -420,13 +421,13 @@ def _ocr_parse_one(src_path, index, total):
             snippet = (result.get("text") or "").strip().replace("\n", " ")[:60]
             extra = f" text={snippet!r}" if snippet else ""
             logger.info(f"OCR frame {index}/{total}: failed ({why}){extra}")
-            return None
+            return None, why
         reading["ocr_backend"] = ocr.backend_label(result.get("backend"), result.get("detail"))
         logger.info(
             f"OCR frame {index}/{total}: humidity={reading.get('remote_humidity')}% "
             f"conf={reading.get('ocr_confidence')} method={reading.get('ocr_method')}"
         )
-        return reading
+        return reading, "ok"
     finally:
         if is_temp and prepared:
             try:
@@ -441,11 +442,12 @@ def _ocr_try_read_frames(frame_paths, prev_humidity):
     if not paths:
         return None, "ocr: no frames"
     total = len(paths)
-    parsed = [_ocr_parse_one(path, i + 1, total) for i, path in enumerate(paths)]
+    pairs = [_ocr_parse_one(path, i + 1, total) for i, path in enumerate(paths)]
+    parsed = [reading for reading, _ in pairs]
     values = [None if r is None else r.get("remote_humidity") for r in parsed]
     if total == 1:
-        reading, why = parsed[0], "ok" if parsed[0] else "ocr: parse failed"
-        consensus_ok = parsed[0] is not None
+        reading, why = pairs[0]
+        consensus_ok = reading is not None
         detail = {"values": values, "agree": 1 if consensus_ok else 0, "method": "single"}
         if consensus_ok:
             logger.info(f"OCR consensus: humidity={reading.get('remote_humidity')}% (single frame)")
