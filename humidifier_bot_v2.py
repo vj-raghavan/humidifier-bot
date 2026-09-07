@@ -102,6 +102,9 @@ FFMPEG_TIMEOUT = _env_int("FFMPEG_TIMEOUT", 15)
 FFMPEG_BIN = _env("FFMPEG_BIN", "/opt/homebrew/bin/ffmpeg")
 # ffmpeg crop=w:h:x:y  (empty = full frame). Remote OUT/CH1 on the 2304x1296 stream.
 FFMPEG_CROP = _env("FFMPEG_CROP", "")
+# Optional tighter crop of the large OUT humidity digits, applied to the
+# already-captured device frame. Empty = derived default sub-crop.
+FFMPEG_CROP_RH = _env("FFMPEG_CROP_RH", "")
 
 VISION_API_BASE = _env("VISION_API_BASE", "http://YOUR_LLM_HOST:1234/v1")
 VISION_MODEL = _env("VISION_MODEL", "qwen/qwen3-vl-4b")
@@ -132,6 +135,15 @@ OCR_TESSERACT_LANG = _env("OCR_TESSERACT_LANG", "eng")
 OCR_TESSERACT_PSM = _env("OCR_TESSERACT_PSM", "6")
 OCR_TESSERACT_WHITELIST = _env("OCR_TESSERACT_WHITELIST", "0123456789.%C")
 OCR_VISION_LEVEL = _env("OCR_VISION_LEVEL", "accurate")
+OCR_PREPROCESS = _env_bool("OCR_PREPROCESS", True)
+OCR_UPSCALE = _env_float("OCR_UPSCALE", 2)
+OCR_CONTRAST = _env_float("OCR_CONTRAST", 1.6)
+OCR_THRESHOLD = _env_int("OCR_THRESHOLD", 0)
+OCR_INVERT = _env_bool("OCR_INVERT", False)
+OCR_CONSENSUS_FRAMES = max(1, _env_int("OCR_CONSENSUS_FRAMES", 3))
+OCR_CONSENSUS_GAP_SECS = _env_float("OCR_CONSENSUS_GAP_SECS", 0.7)
+OCR_CONSENSUS_MIN_AGREE = max(1, _env_int("OCR_CONSENSUS_MIN_AGREE", 2))
+OCR_CONSENSUS_MAX_DELTA = max(0, _env_int("OCR_CONSENSUS_MAX_DELTA", 2))
 
 VISION_PROMPT = """This image is a cropped close-up of a ThermoPro display showing the REMOTE sensor (labeled OUT / CH1).
 The large digits for the remote sensor are temperature in Celsius (upper part) and humidity with a % symbol (lower part).
@@ -274,6 +286,30 @@ def capture_frame(crop=True):
         return None
 
 
+def capture_cycle_frames():
+    """Capture OCR_CONSENSUS_FRAMES device crops spaced OCR_CONSENSUS_GAP_SECS apart."""
+    n = max(1, int(OCR_CONSENSUS_FRAMES))
+    gap = float(OCR_CONSENSUS_GAP_SECS)
+    paths = []
+    for i in range(n):
+        path = capture_frame(crop=True)
+        if path:
+            paths.append(path)
+        if i < n - 1 and gap > 0 and not _runtime["stopping"]:
+            sleep_seconds(gap)
+    return paths
+
+
+def _unlink_frames(paths):
+    for path in paths or []:
+        if not path:
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def save_crop_preview(cropped_path):
     """Persist dated stills for crop-drift debugging. Returns paths written."""
     os.makedirs(STILLS_DIR, exist_ok=True)
@@ -323,27 +359,114 @@ def _wait_then_retry_vision(attempt, max_retries, retry_delay, reason):
     return False
 
 
-def _ocr_try_read(image_path, prev_humidity):
-    """Local OCR → parse → confidence/plausibility. Returns (reading, why)."""
-    result = ocr.ocr_image(
-        image_path,
-        timeout=OCR_TIMEOUT,
-        prefer=OCR_BACKEND,
-        tesseract_bin=OCR_TESSERACT_BIN,
-        tesseract_lang=OCR_TESSERACT_LANG,
-        tesseract_psm=OCR_TESSERACT_PSM,
-        tesseract_whitelist=OCR_TESSERACT_WHITELIST,
-        vision_level=OCR_VISION_LEVEL,
+def _rh_crop_for_frame(src_path):
+    size = ocr.probe_image_size(src_path, ffmpeg_bin=FFMPEG_BIN)
+    img_w, img_h = size if size else (None, None)
+    crop = ocr.resolve_rh_crop(FFMPEG_CROP_RH, img_w, img_h)
+    if crop:
+        return crop
+    if not FFMPEG_CROP_RH:
+        return (
+            f"iw*{ocr.RH_CROP_W_FRAC}:ih*{ocr.RH_CROP_H_FRAC}:"
+            f"iw*{ocr.RH_CROP_X_FRAC}:ih*{ocr.RH_CROP_Y_FRAC}"
+        )
+    logger.warning(f"Ignoring invalid FFMPEG_CROP_RH={FFMPEG_CROP_RH!r}")
+    return None
+
+
+def _prepare_ocr_input(src_path):
+    """RH-only crop + preprocess. Returns (path, is_temp)."""
+    crop = _rh_crop_for_frame(src_path)
+    prepared, is_temp, err = ocr.prepare_ocr_frame(
+        src_path,
+        crop=crop,
+        preprocess=OCR_PREPROCESS,
+        upscale=OCR_UPSCALE,
+        contrast=OCR_CONTRAST,
+        threshold=OCR_THRESHOLD,
+        invert=OCR_INVERT,
+        ffmpeg_bin=FFMPEG_BIN,
+        timeout=max(FFMPEG_TIMEOUT, OCR_TIMEOUT),
     )
-    if result.get("error"):
-        return None, result["error"]
-    reading, why = ocr.parse_thermopro_ocr(
-        result.get("text") or "",
-        result.get("observations") or [],
-        plausible_min=HUMIDITY_PLAUSIBLE_MIN,
-        plausible_max=HUMIDITY_PLAUSIBLE_MAX,
-    )
-    if reading is None:
+    if err:
+        logger.info(f"OCR prepare: {err} — using source frame")
+    return prepared, is_temp and prepared != src_path
+
+
+def _ocr_parse_one(src_path, index, total):
+    """OCR+parse one device frame (no jump check). Logs the per-frame result."""
+    prepared, is_temp = _prepare_ocr_input(src_path)
+    try:
+        result = ocr.ocr_image(
+            prepared,
+            timeout=OCR_TIMEOUT,
+            prefer=OCR_BACKEND,
+            tesseract_bin=OCR_TESSERACT_BIN,
+            tesseract_lang=OCR_TESSERACT_LANG,
+            tesseract_psm=OCR_TESSERACT_PSM,
+            tesseract_whitelist=OCR_TESSERACT_WHITELIST,
+            vision_level=OCR_VISION_LEVEL,
+        )
+        if result.get("error"):
+            logger.info(f"OCR frame {index}/{total}: failed ({result['error']})")
+            return None
+        reading, why = ocr.parse_thermopro_ocr(
+            result.get("text") or "",
+            result.get("observations") or [],
+            plausible_min=HUMIDITY_PLAUSIBLE_MIN,
+            plausible_max=HUMIDITY_PLAUSIBLE_MAX,
+        )
+        if reading is None:
+            snippet = (result.get("text") or "").strip().replace("\n", " ")[:60]
+            extra = f" text={snippet!r}" if snippet else ""
+            logger.info(f"OCR frame {index}/{total}: failed ({why}){extra}")
+            return None
+        reading["ocr_backend"] = ocr.backend_label(result.get("backend"), result.get("detail"))
+        logger.info(
+            f"OCR frame {index}/{total}: humidity={reading.get('remote_humidity')}% "
+            f"conf={reading.get('ocr_confidence')} method={reading.get('ocr_method')}"
+        )
+        return reading
+    finally:
+        if is_temp and prepared:
+            try:
+                os.remove(prepared)
+            except OSError:
+                pass
+
+
+def _ocr_try_read_frames(frame_paths, prev_humidity):
+    """OCR(+parse) each frame, then consensus + plausibility. Returns (reading, why)."""
+    paths = [p for p in (frame_paths or []) if p]
+    if not paths:
+        return None, "ocr: no frames"
+    total = len(paths)
+    parsed = [_ocr_parse_one(path, i + 1, total) for i, path in enumerate(paths)]
+    values = [None if r is None else r.get("remote_humidity") for r in parsed]
+    if total == 1:
+        reading, why = parsed[0], "ok" if parsed[0] else "ocr: parse failed"
+        consensus_ok = parsed[0] is not None
+        detail = {"values": values, "agree": 1 if consensus_ok else 0, "method": "single"}
+        if consensus_ok:
+            logger.info(f"OCR consensus: humidity={reading.get('remote_humidity')}% (single frame)")
+        else:
+            logger.info(f"OCR consensus: failed ({why}) values={values}")
+    else:
+        reading, why, detail = ocr.consensus_humidity(
+            parsed,
+            min_agree=OCR_CONSENSUS_MIN_AGREE,
+            max_delta=OCR_CONSENSUS_MAX_DELTA,
+        )
+        consensus_ok = reading is not None
+        if consensus_ok:
+            logger.info(
+                f"OCR consensus: humidity={reading.get('remote_humidity')}% "
+                f"({detail.get('method')} agree={detail.get('agree')}/{total} "
+                f"values={values} max_delta={OCR_CONSENSUS_MAX_DELTA})"
+            )
+        else:
+            logger.info(f"OCR consensus: failed ({why}) values={values}")
+    if not consensus_ok:
         return None, why
     ok, reason = ocr.accept_ocr_reading(
         reading,
@@ -356,21 +479,30 @@ def _ocr_try_read(image_path, prev_humidity):
         plausibility_fn=ops.reading_is_plausible,
     )
     if not ok:
+        logger.info(f"OCR consensus rejected: {reason}")
         return None, reason
     reading["source"] = "ocr"
-    reading["ocr_backend"] = ocr.backend_label(result.get("backend"), result.get("detail"))
+    if "ocr_consensus" not in reading:
+        reading["ocr_consensus"] = detail
     return reading, "ok"
 
 
-def resolve_humidity_reading(image_path, prev_humidity=None, model_name=None):
+def _ocr_try_read(image_path, prev_humidity):
+    """Local OCR → parse → confidence/plausibility. Returns (reading, why)."""
+    return _ocr_try_read_frames([image_path], prev_humidity)
+
+
+def resolve_humidity_reading(image_path, prev_humidity=None, model_name=None, ocr_frame_paths=None):
     """OCR-first humidity read with optional vision-LLM fallback.
 
     Returns (reading_or_None, kind) using the same VISION_* kinds as the LLM
     path so host-down backoff still applies when falling back.
+    LLM fallback uses ``image_path`` (device crop), not the RH-only OCR crop.
     """
     mode = HUMIDITY_READ_MODE
     if mode != ocr.READ_MODE_LLM_ONLY:
-        ocr_reading, ocr_why = _ocr_try_read(image_path, prev_humidity)
+        frames = [p for p in (ocr_frame_paths or [image_path]) if p]
+        ocr_reading, ocr_why = _ocr_try_read_frames(frames, prev_humidity)
         if ocr_reading is not None:
             logger.info(
                 f"Humidity via ocr ({ocr_reading.get('ocr_backend')} "
@@ -824,11 +956,13 @@ def maybe_crop_drift_alert(reason, frame_path, history):
         paths = save_crop_preview(frame_path)
     ops.bump_stat(history, "crop_drift_alerts", 1)
     crop = FFMPEG_CROP or "(none — full frame)"
+    rh = FFMPEG_CROP_RH or "(default OUT humidity sub-crop)"
     path_txt = "\n".join(paths) if paths else "(no still saved)"
     send_ntfy(
         "Humidifier crop drift?",
         f"OCR/range/split failures x{_runtime['quality_fail_streak']}: {reason}\n"
         f"Check FFMPEG_CROP={crop}\n"
+        f"FFMPEG_CROP_RH={rh}\n"
         f"Preview:\n{path_txt}",
         tags="warning,camera",
         rate_key="crop_drift",
@@ -881,6 +1015,14 @@ def main():
         f"(local OCR={ocr.backend_label(ocr_backend, ocr_detail)}, "
         f"min_conf={OCR_MIN_CONFIDENCE}, timeout={OCR_TIMEOUT}s)"
     )
+    logger.info(
+        f"OCR preprocess: on={int(OCR_PREPROCESS)} upscale={OCR_UPSCALE} "
+        f"contrast={OCR_CONTRAST} threshold={OCR_THRESHOLD} invert={int(OCR_INVERT)}"
+    )
+    logger.info(
+        f"OCR consensus: frames={OCR_CONSENSUS_FRAMES} gap={OCR_CONSENSUS_GAP_SECS}s "
+        f"min_agree={OCR_CONSENSUS_MIN_AGREE} max_delta={OCR_CONSENSUS_MAX_DELTA}"
+    )
     logger.info(f"Vision LLM fallback: {VISION_MODEL_4B} @ {VISION_API_BASE}")
     logger.info(
         f"Vision retries: {VISION_MAX_RETRIES} attempts, {VISION_RETRY_DELAY}s delay, "
@@ -888,6 +1030,14 @@ def main():
     )
     if FFMPEG_CROP:
         logger.info(f"Frame crop: {FFMPEG_CROP} (w:h:x:y)")
+    if FFMPEG_CROP_RH:
+        logger.info(f"RH crop: {FFMPEG_CROP_RH} (on captured frame)")
+    else:
+        logger.info(
+            "RH crop: default "
+            f"{ocr.RH_CROP_W_FRAC}:{ocr.RH_CROP_H_FRAC}:"
+            f"{ocr.RH_CROP_X_FRAC}:{ocr.RH_CROP_Y_FRAC} of captured frame (w:h:x:y fractions)"
+        )
     logger.info(
         f"Safety: max ON {MAX_ON_SECS}s, cooldown {MAX_ON_COOLDOWN_SECS}s, "
         f"plausible RH {HUMIDITY_PLAUSIBLE_MIN}-{HUMIDITY_PLAUSIBLE_MAX}%, "
@@ -941,15 +1091,17 @@ def main():
             sleep_seconds(CHECK_INTERVAL)
             continue
 
-        frame_path = capture_frame()
+        frame_paths = capture_cycle_frames()
+        frame_path = frame_paths[-1] if frame_paths else None
         reading = None
         vision_kind = ops.VISION_SOFT
 
-        if frame_path:
+        if frame_paths:
             reading, vision_kind = resolve_humidity_reading(
                 frame_path,
                 prev_humidity=last_good_humidity(history),
                 model_name=VISION_MODEL_4B,
+                ocr_frame_paths=frame_paths,
             )
 
         fail_reason = None
@@ -965,11 +1117,8 @@ def main():
             fail_reason = "no valid humidity / unparseable OCR"
             maybe_crop_drift_alert(fail_reason, frame_path, history)
 
-        if frame_path:
-            try:
-                os.remove(frame_path)
-            except OSError:
-                pass
+        if frame_paths:
+            _unlink_frames(frame_paths)
 
         if reading is None or reading.get("remote_humidity") is None:
             consecutive_failures += 1

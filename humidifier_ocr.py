@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,14 @@ _NUM_TOKEN_RE = re.compile(
     re.I,
 )
 _SWIFT_CACHE_NAME = "humidifier-ocr-vision"
+
+# Default RH-only box as fractions of the already-captured (device) frame.
+# ThermoPro OUT humidity sits in the upper/mid display (temp above, IN below).
+RH_CROP_W_FRAC = 0.72
+RH_CROP_H_FRAC = 0.34
+RH_CROP_X_FRAC = 0.16
+RH_CROP_Y_FRAC = 0.36
+_CROP_SPEC_RE = re.compile(r"^\s*(\d+(?:\.\d+)?):(\d+(?:\.\d+)?):(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)\s*$")
 
 # VNRecognizeTextRequest helper; compiled once per source hash on macOS.
 _SWIFT_SOURCE = r"""
@@ -670,3 +679,391 @@ def accept_ocr_reading(
         max_jump=max_jump,
         remote_local_max_delta=remote_local_max_delta,
     )
+
+
+def parse_crop_spec(spec):
+    """Parse ffmpeg crop=w:h:x:y. Returns (w, h, x, y) ints or None."""
+    if not spec or not str(spec).strip():
+        return None
+    match = _CROP_SPEC_RE.match(str(spec).strip())
+    if not match:
+        return None
+    w, h, x, y = (int(round(float(p))) for p in match.groups())
+    if w < 1 or h < 1 or x < 0 or y < 0:
+        return None
+    return w, h, x, y
+
+
+def format_crop_spec(w, h, x, y):
+    return f"{int(w)}:{int(h)}:{int(x)}:{int(y)}"
+
+
+def clamp_crop(w, h, x, y, img_w, img_h):
+    if img_w < 1 or img_h < 1:
+        return None
+    x = max(0, min(int(x), img_w - 1))
+    y = max(0, min(int(y), img_h - 1))
+    w = max(1, min(int(w), img_w - x))
+    h = max(1, min(int(h), img_h - y))
+    return w, h, x, y
+
+
+def default_rh_crop(img_w, img_h):
+    """Pixel crop of the large OUT humidity digits on a device-framed still."""
+    w = max(1, int(round(img_w * RH_CROP_W_FRAC)))
+    h = max(1, int(round(img_h * RH_CROP_H_FRAC)))
+    x = max(0, int(round(img_w * RH_CROP_X_FRAC)))
+    y = max(0, int(round(img_h * RH_CROP_Y_FRAC)))
+    clamped = clamp_crop(w, h, x, y, img_w, img_h)
+    if not clamped:
+        return None
+    return format_crop_spec(*clamped)
+
+
+def resolve_rh_crop(spec, img_w=None, img_h=None):
+    """Explicit FFMPEG_CROP_RH, else default sub-crop when image size is known."""
+    parsed = parse_crop_spec(spec)
+    if parsed and img_w and img_h:
+        clamped = clamp_crop(*parsed, img_w, img_h)
+        return format_crop_spec(*clamped) if clamped else None
+    if parsed:
+        return format_crop_spec(*parsed)
+    if img_w and img_h:
+        return default_rh_crop(img_w, img_h)
+    return None
+
+
+def probe_image_size(path, ffmpeg_bin="ffmpeg"):
+    """Return (width, height) or None."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            return int(im.size[0]), int(im.size[1])
+    except Exception:
+        pass
+    probe = _which("ffprobe")
+    if not probe and ffmpeg_bin:
+        cand = os.path.join(os.path.dirname(ffmpeg_bin), "ffprobe")
+        probe = cand if os.path.isfile(cand) and os.access(cand, os.X_OK) else _which("ffprobe")
+    if probe:
+        try:
+            result = _run_captured(
+                [
+                    probe,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height",
+                    "-of",
+                    "csv=p=0:s=x",
+                    path,
+                ],
+                timeout=8,
+            )
+            if result.returncode == 0 and "x" in (result.stdout or ""):
+                w_s, h_s = result.stdout.strip().split("x", 1)
+                w, h = int(w_s), int(h_s)
+                if w > 0 and h > 0:
+                    return w, h
+        except Exception:
+            pass
+    return None
+
+
+def ocr_vf_filters(
+    *,
+    crop=None,
+    preprocess=True,
+    upscale=2.0,
+    contrast=1.6,
+    threshold=0,
+    invert=False,
+):
+    """ffmpeg -vf chain for RH crop + OCR preprocess (crop first)."""
+    filters = []
+    if crop:
+        filters.append(f"crop={crop}")
+    if not preprocess:
+        return filters
+    try:
+        scale = float(upscale)
+    except (TypeError, ValueError):
+        scale = 1.0
+    if scale > 1.01:
+        filters.append(f"scale=iw*{scale}:ih*{scale}:flags=lanczos")
+    filters.append("format=gray")
+    try:
+        cont = float(contrast)
+    except (TypeError, ValueError):
+        cont = 1.0
+    if abs(cont - 1.0) >= 0.01:
+        filters.append(f"eq=contrast={cont}")
+    if invert:
+        filters.append("negate")
+    try:
+        thr = int(float(threshold))
+    except (TypeError, ValueError):
+        thr = 0
+    if thr > 0:
+        filters.append(f"lutyuv=y='if(gte(val,{thr}),255,0)'")
+    return filters
+
+
+def _pillow_prepare(src_path, dest_path, crop, preprocess, upscale, contrast, threshold, invert):
+    from PIL import Image, ImageEnhance, ImageOps
+
+    with Image.open(src_path) as im:
+        im = im.convert("RGB")
+        img_w, img_h = im.size
+        if crop:
+            parsed = parse_crop_spec(crop)
+            if parsed:
+                clamped = clamp_crop(*parsed, img_w, img_h)
+                if clamped:
+                    w, h, x, y = clamped
+                    im = im.crop((x, y, x + w, y + h))
+        if preprocess:
+            try:
+                scale = float(upscale)
+            except (TypeError, ValueError):
+                scale = 1.0
+            if scale > 1.01:
+                nw = max(1, int(round(im.size[0] * scale)))
+                nh = max(1, int(round(im.size[1] * scale)))
+                try:
+                    resample = Image.Resampling.LANCZOS
+                except AttributeError:
+                    resample = Image.LANCZOS
+                im = im.resize((nw, nh), resample)
+            im = ImageOps.grayscale(im)
+            try:
+                cont = float(contrast)
+            except (TypeError, ValueError):
+                cont = 1.0
+            if abs(cont - 1.0) >= 0.01:
+                im = ImageEnhance.Contrast(im).enhance(cont)
+            if invert:
+                im = ImageOps.invert(im)
+            try:
+                thr = int(float(threshold))
+            except (TypeError, ValueError):
+                thr = 0
+            if thr > 0:
+                im = im.point(lambda p: 255 if p >= thr else 0)
+        ext = os.path.splitext(dest_path)[1].lower()
+        if ext in (".jpg", ".jpeg"):
+            im.convert("L" if preprocess else "RGB").save(dest_path, format="JPEG", quality=92)
+        else:
+            im.save(dest_path)
+    return dest_path
+
+
+def prepare_ocr_frame(
+    src_path,
+    dest_path=None,
+    *,
+    crop=None,
+    preprocess=True,
+    upscale=2.0,
+    contrast=1.6,
+    threshold=0,
+    invert=False,
+    ffmpeg_bin="ffmpeg",
+    timeout=15,
+    impl="auto",
+):
+    """Apply RH crop + preprocess. Returns (path, is_temp, error).
+
+    On failure, path is the original src_path and is_temp is False.
+    """
+    if not src_path or not os.path.isfile(src_path):
+        return src_path, False, "ocr prepare: missing source image"
+    filters = ocr_vf_filters(
+        crop=crop,
+        preprocess=preprocess,
+        upscale=upscale,
+        contrast=contrast,
+        threshold=threshold,
+        invert=invert,
+    )
+    if not filters:
+        return src_path, False, None
+
+    close_dest = False
+    if not dest_path:
+        fd, dest_path = tempfile.mkstemp(prefix="humidifier_ocr_", suffix=".jpg")
+        os.close(fd)
+        close_dest = True
+
+    how = (impl or "auto").strip().lower()
+    ffmpeg_path = _which(ffmpeg_bin) or _which("ffmpeg")
+    errors = []
+
+    if how in ("auto", "ffmpeg") and ffmpeg_path:
+        try:
+            result = _run_captured(
+                [
+                    ffmpeg_path,
+                    "-y",
+                    "-i",
+                    src_path,
+                    "-vf",
+                    ",".join(filters),
+                    "-frames:v",
+                    "1",
+                    "-q:v",
+                    "2",
+                    dest_path,
+                ],
+                timeout=timeout,
+            )
+            size = os.path.getsize(dest_path) if os.path.isfile(dest_path) else 0
+            if result.returncode == 0 and size > 0:
+                return dest_path, True, None
+            err = (result.stderr or "").strip().splitlines()
+            errors.append(err[-1] if err else f"ffmpeg rc={result.returncode}")
+        except Exception as e:
+            errors.append(str(e))
+        if how == "ffmpeg":
+            if close_dest:
+                try:
+                    os.remove(dest_path)
+                except OSError:
+                    pass
+            return src_path, False, f"ocr prepare ffmpeg: {errors[-1] if errors else 'failed'}"
+
+    if how in ("auto", "pillow"):
+        try:
+            _pillow_prepare(
+                src_path,
+                dest_path,
+                crop,
+                preprocess,
+                upscale,
+                contrast,
+                threshold,
+                invert,
+            )
+            if os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0:
+                return dest_path, True, None
+        except Exception as e:
+            errors.append(str(e))
+
+    if close_dest:
+        try:
+            os.remove(dest_path)
+        except OSError:
+            pass
+    return src_path, False, f"ocr prepare failed: {'; '.join(errors) or 'no backend'}"
+
+
+def _humidity_values(readings):
+    values = []
+    for item in readings or []:
+        if not item:
+            values.append(None)
+            continue
+        rh = item.get("remote_humidity") if isinstance(item, dict) else item
+        try:
+            values.append(int(round(float(rh))))
+        except (TypeError, ValueError):
+            values.append(None)
+    return values
+
+
+def _cluster_indices(values, max_delta):
+    """Largest set of indices whose RH values span <= max_delta."""
+    numbered = [(i, v) for i, v in enumerate(values) if v is not None]
+    if not numbered:
+        return []
+    order = sorted(numbered, key=lambda t: t[1])
+    best = []
+    j = 0
+    for i in range(len(order)):
+        while j < len(order) and order[j][1] - order[i][1] <= max_delta:
+            j += 1
+        window = order[i:j]
+        if len(window) > len(best):
+            best = window
+        elif len(window) == len(best) and window and best:
+            span = window[-1][1] - window[0][1]
+            best_span = best[-1][1] - best[0][1]
+            if span < best_span:
+                best = window
+    return [idx for idx, _ in best]
+
+
+def consensus_humidity(readings, *, min_agree=2, max_delta=2):
+    """Agree on remote humidity across frame readings.
+
+    ``readings`` is a list of parse dicts or None (failed OCR/parse).
+    Returns (merged_reading_or_None, reason, detail).
+    """
+    values = _humidity_values(readings)
+    present = [v for v in values if v is not None]
+    n = len(readings or [])
+    effective_min = max(1, min(int(min_agree), n if n else int(min_agree)))
+    detail = {
+        "values": values,
+        "min_agree": effective_min,
+        "max_delta": max_delta,
+        "agree": 0,
+        "humidity": None,
+        "method": None,
+    }
+    if not present:
+        return None, "ocr consensus: no humidity readings", detail
+
+    span_all = max(present) - min(present)
+    if len(present) >= effective_min and span_all <= max_delta:
+        humidity = int(round(statistics.median(present)))
+        cluster_idx = [i for i, v in enumerate(values) if v is not None]
+        detail.update(agree=len(present), humidity=humidity, method="median")
+        return _merge_consensus_reading(readings, cluster_idx, humidity, detail), "ok", detail
+
+    cluster_idx = _cluster_indices(values, max_delta)
+    cluster_vals = [values[i] for i in cluster_idx]
+    if len(cluster_vals) >= effective_min:
+        humidity = int(round(statistics.median(cluster_vals)))
+        detail.update(agree=len(cluster_vals), humidity=humidity, method="cluster")
+        return _merge_consensus_reading(readings, cluster_idx, humidity, detail), "ok", detail
+
+    detail["agree"] = len(cluster_vals)
+    return (
+        None,
+        (
+            f"ocr consensus: {len(present)} reading(s) {present} "
+            f"need {effective_min} within {max_delta}pt"
+        ),
+        detail,
+    )
+
+
+def _merge_consensus_reading(readings, indices, humidity, detail):
+    pool = [readings[i] for i in indices if readings[i]]
+    if not pool:
+        return None
+    best = max(
+        pool,
+        key=lambda r: (
+            1 if r.get("remote_humidity") == humidity else 0,
+            r.get("ocr_confidence") or 0,
+        ),
+    )
+    merged = dict(best)
+    merged["remote_humidity"] = humidity
+    confs = [r.get("ocr_confidence") for r in pool if isinstance(r.get("ocr_confidence"), (int, float))]
+    if confs:
+        merged["ocr_confidence"] = round(sum(confs) / len(confs), 3)
+    merged["ocr_consensus"] = {
+        "values": detail.get("values"),
+        "agree": detail.get("agree"),
+        "method": detail.get("method"),
+        "humidity": humidity,
+    }
+    return merged
